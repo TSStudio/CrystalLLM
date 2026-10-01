@@ -1,0 +1,747 @@
+diff --git a/torch/distributed/distributed_c10d.py b/torch/distributed/distributed_c10d.py
+index 668dbf49a0d..57a5cbf7514 100644
+--- a/torch/distributed/distributed_c10d.py
++++ b/torch/distributed/distributed_c10d.py
+@@ -53,6 +53,57 @@ from .c10d_logger import _exception_logger, _time_logger
+ from .constants import default_pg_nccl_timeout, default_pg_timeout
+ from .rendezvous import register_rendezvous_handler, rendezvous  # noqa: F401
+ 
++try:
++    from crystalllm.patch import crystal_patch_response
++    from crystalllm.torch import (
++        CrystalFakeProcessGroup,
++        cond_crystal_c10d_trace_writer,
++        cond_crystal_collectives_handler,
++        cond_custom_write_crystal_c10d_trace,
++        cond_crystal_c10d_start_coalescing,
++        cond_crystal_c10d_end_coalescing,
++        cond_crystal_runtime_profiler_start_coalescing,
++        cond_crystal_runtime_profiler_end_coalescing,
++    )
++    _CRYSTAL_AVAILABLE = True
++except ImportError as e:
++    if sys.modules.get("crystalllm") is not None:
++        # crystalllm is present but only partially initialized: this import
++        # failure is a circular-import regression, never mask it with no-ops.
++        raise
++    # crystalllm is not installed: keep the baseline path working with no-op
++    # wrappers, and fail fast when a crystal feature is explicitly enabled
++    # via environment variables.
++    from typing import TypeVar
++    from typing_extensions import ParamSpec
++    _T = TypeVar("_T")
++    _P = ParamSpec("_P")
++    _CRYSTAL_AVAILABLE = False
++    _CRYSTAL_IMPORT_ERROR = e
++    def crystal_patch_response(func: Callable[_P, _T]) -> Callable[_P,_T]:
++        return func
++    def cond_crystal_c10d_trace_writer(func: Callable[_P, _T]) -> Callable[_P,_T]:
++        return func
++    def cond_crystal_collectives_handler(func: Callable[_P, _T]) -> Callable[_P,_T]:
++        return func
++    def _crystal_missing(feature: str) -> None:
++        raise RuntimeError(
++            f"{feature} requires the 'crystalllm' package, which could not be "
++            f"imported: {_CRYSTAL_IMPORT_ERROR}"
++        )
++    def cond_custom_write_crystal_c10d_trace(log_type: str, log_detail: str) -> None:
++        _crystal_missing("cond_custom_write_crystal_c10d_trace")
++    def cond_crystal_c10d_start_coalescing(group, device_set, async_ops):
++        _crystal_missing("cond_crystal_c10d_start_coalescing")
++    def cond_crystal_c10d_end_coalescing(group, device_set, async_ops):
++        _crystal_missing("cond_crystal_c10d_end_coalescing")
++    def cond_crystal_runtime_profiler_start_coalescing(group, async_ops):
++        _crystal_missing("cond_crystal_runtime_profiler_start_coalescing")
++    def cond_crystal_runtime_profiler_end_coalescing(group, async_ops, launch_func):
++        _crystal_missing("cond_crystal_runtime_profiler_end_coalescing")
++    class CrystalFakeProcessGroup:
++        def __init__(self, *args, **kwargs):
++            _crystal_missing("CrystalFakeProcessGroup")
+ 
+ __all__ = [
+     "Backend",
+@@ -737,6 +788,11 @@ class GroupMember(metaclass=_WorldMeta):
+ 
+     NON_GROUP_MEMBER = -100
+ 
++# [Crystal Patch]
++# If communication capturing is enabled, use CrystalFakeProcessGroup
++_FAKE_DEFAULT_PG = None
++# Hold the c-string buffer created in new_group to avoid GC
++_CRYSTAL_NCCL_COMMNAME_HOLDER: list = []
+ 
+ def _get_default_timeout(backend: Backend) -> timedelta:
+     # see note on nccl vs other backend timeout (constants.py)
+@@ -1269,7 +1325,12 @@ def is_backend_available(backend: str) -> bool:
+ 
+ def is_initialized() -> bool:
+     """Check if the default process group has been initialized."""
+-    return GroupMember.WORLD is not None
++    # [Crystal Patch]
++    # If communication capturing is enabled, is_initialized will check FAKE_DEFAULT_PG
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        return _FAKE_DEFAULT_PG is not None
++    else:
++        return GroupMember.WORLD is not None
+ 
+ 
+ def is_torchelastic_launched() -> bool:
+@@ -1300,10 +1361,15 @@ def _get_default_group() -> ProcessGroup:
+             "Default process group has not been initialized, "
+             "please make sure to call init_process_group."
+         )
+-    if TYPE_CHECKING:
+-        return not_none(GroupMember.WORLD)
++    # [Crystal Patch]
++    # If communication capturing is enabled, return _FAKE_DEFAULT_PG as the default process group
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        return _FAKE_DEFAULT_PG
+     else:
+-        return GroupMember.WORLD
++        if TYPE_CHECKING:
++            return not_none(GroupMember.WORLD)
++        else:
++            return GroupMember.WORLD
+ 
+ 
+ def _get_default_store() -> Store:
+@@ -1357,17 +1423,20 @@ def get_backend(group: Optional[ProcessGroup] = None) -> Backend:
+         The backend of the given process group as a lower case string.
+ 
+     """
+-    pg = group or _get_default_group()
+-    if _rank_not_in_group(pg):
+-        raise ValueError("Invalid process group specified")
+-
+-    pg_store = _world.pg_map.get(pg, None)
+-    if pg_store is None:
+-        raise ValueError(
+-            f"Process group {pg} is not initialized in the world group map. Please initialize the group first."
+-        )
+-
+-    return Backend(not_none(pg_store)[0])
++    # [Crystal Patch]
++    # If communication capturing is enabled, use `fake` to represent the backend
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        return "fake"
++    else:
++        pg = group or _get_default_group()
++        if _rank_not_in_group(pg):
++            raise ValueError("Invalid process group specified")
++        pg_store = _world.pg_map.get(pg, None)
++        if pg_store is None:
++            raise ValueError(
++                f"Process group {pg} is not initialized in the world group map. Please initialize the group first."
++            )
++        return Backend(not_none(pg_store)[0])
+ 
+ 
+ def get_default_backend_for_device(device: Union[str, torch.device]) -> str:
+@@ -1632,6 +1701,51 @@ def init_process_group(
+ 
+     global _world
+ 
++    # [Crystal Patch]
++    # If communication capturing is enabled, init_process_group will be bypassed
++    # and a _FakeProcessGroup will be created.
++    global _FAKE_DEFAULT_PG
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        logger.info("Crystal communication capturing enabled, bypass init_process_group and new_group")
++        if _FAKE_DEFAULT_PG is not None:
++            raise ValueError("trying to initialize the default process group twice!")
++        group_name = _process_group_name([], use_hashed_name=False)
++        _FAKE_DEFAULT_PG = CrystalFakeProcessGroup(
++            list(range(world_size)),
++            rank,
++            group_name,
++            "default_pg"
++        )
++        _world.pg_group_ranks[_FAKE_DEFAULT_PG] = {
++            global_rank: group_rank for group_rank, global_rank in enumerate(range(world_size))
++        }
++        _world.pg_names[_FAKE_DEFAULT_PG] = group_name
++        return _FAKE_DEFAULT_PG
++
++    if os.getenv("CRYSTAL_MOCK_NCCL_INIT_STORE_SIZE") is not None:
++        master_addr = os.getenv('MASTER_ADDR')
++        master_port = int(os.getenv('MASTER_PORT'))
++        init_store_size = int(os.getenv('CRYSTAL_MOCK_NCCL_INIT_STORE_SIZE'))
++
++        # Create TCPStore with custom store_size
++        from datetime import timedelta
++        from torch.distributed import TCPStore
++
++        store_timeout = timeout if timeout is not None else timedelta(minutes=180)
++
++        custom_store = TCPStore(
++            host_name=master_addr,
++            port=master_port,
++            world_size=init_store_size,
++            is_master=(rank == 0),
++            timeout=store_timeout
++        )
++        store = custom_store
++
++        # Replace init_method with store in kwargs
++        if init_method is not None:
++            init_method = None
++
+     global _backend
+     global _default_pg_init_method
+ 
+@@ -1975,6 +2089,33 @@ def _new_process_group_helper(
+                 )
+             backend_options.global_ranks_in_group = global_ranks_in_group
+             backend_options.group_name = group_name
++
++            # [Crystal Patch] Inject group_desc into ncclConfig_t.commName
++            # The Python binding does not expose commName (AttributeError).
++            # We write it at offset 48 of ncclConfig_v22700 layout using ctypes.
++            # 48 = size_t (8) + 2 * unsigned int (4) + 4 * int (4) + ptr_t (8) + 2 * int (4)
++            # MUST use another value if the size of these types changed.
++            if group_desc and group_desc != "undefined":
++                import ctypes as _ctypes
++                # The group description format used by CrystalLLM in Megatron is
++                # "{NAME}-{rank}-{group_name}-{backend}". The per-rank group_desc
++                # must be normalize so that all ranks of the same logical group
++                # share one Redis key. We replace the rank field with "0".
++                # e.g. DATA_PARALLEL_GROUP-8-9-nccl and DATA_PARALLEL_GROUP-0-9-nccl
++                # both produce DATA_PARALLEL_GROUP-0-9-nccl.
++                _normalized_group_desc = group_desc
++                _parts = group_desc.split("-")
++                if len(_parts) >= 4 and _parts[-3].isdigit():
++                    _parts[-3] = "0"
++                    _normalized_group_desc = "-".join(_parts)
++
++                _group_desc_cstring_buf = _ctypes.create_string_buffer(_normalized_group_desc.encode("utf-8"), 256)
++                _CRYSTAL_NCCL_COMMNAME_HOLDER.append(_group_desc_cstring_buf)
++                _group_desc_cstring_buf_ptr = _ctypes.c_void_p(_ctypes.addressof(_group_desc_cstring_buf))
++                _CRYSTAL_NCCL_COMMNAME_HOLDER.append(_group_desc_cstring_buf_ptr)
++                _nccl_config_ptr = _ctypes.c_uint64.from_address(id(backend_options.config) + 16).value
++                _ctypes.memmove(_nccl_config_ptr + 48, _ctypes.addressof(_group_desc_cstring_buf_ptr), 8)
++
+             backend_class = ProcessGroupNCCL(
+                 backend_prefix_store, group_rank, group_size, backend_options
+             )
+@@ -2110,6 +2251,11 @@ def destroy_process_group(group: Optional[ProcessGroup] = None):
+     """
+     global _world
+ 
++    # [Crystal Patch]
++    # If communication capturing is enabled, destroy_process_group will be bypassed
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        return
++
+     if group == GroupMember.NON_GROUP_MEMBER:
+         return
+ 
+@@ -2292,6 +2438,16 @@ def get_rank(group: Optional[ProcessGroup] = None) -> int:
+         -1, if not part of the group
+ 
+     """
++    # [Crystal Patch]
++    # If communication capturing is enabled, use FAKE_DEFAULT_PG instead of default_pg of _world
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        if _rank_not_in_group(group):
++            return -1
++        if group is None:
++            return _FAKE_DEFAULT_PG.rank()
++        else:
++            return group.rank()
++
+     if _rank_not_in_group(group):
+         return -1
+ 
+@@ -2315,12 +2471,25 @@ def get_world_size(group: Optional[ProcessGroup] = None) -> int:
+         -1, if not part of the group
+ 
+     """
++    # [Crystal Patch]
++    # If communication capturing is enabled, use FAKE_DEFAULT_PG instead of default_pg of _world
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        if _rank_not_in_group(group):
++            return -1
++        if group is None:
++            return _FAKE_DEFAULT_PG.size()
++        else:
++            return group.size()
++
+     if _rank_not_in_group(group):
+         return -1
+ 
+     return _get_group_size(group)
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ def isend(
+     tensor: torch.Tensor,
+     dst: Optional[int] = None,
+@@ -2366,6 +2535,9 @@ def isend(
+     return group.send([tensor], group_dst, tag)
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ def irecv(
+     tensor: torch.Tensor,
+     src: Optional[int] = None,
+@@ -2411,6 +2583,9 @@ def irecv(
+         return group.recv([tensor], group_src, tag)
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def send(
+     tensor: torch.Tensor,
+@@ -2443,6 +2618,9 @@ def send(
+         work.wait()
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def recv(
+     tensor: torch.Tensor,
+@@ -2509,6 +2687,9 @@ class _CoalescingManager:
+         for work in self.works:
+             work.wait()
+ 
++    def is_completed(self):
++        return all(work.is_completed() for work in self.works)
++
+ 
+ @contextlib.contextmanager
+ def _coalescing_manager(
+@@ -2549,62 +2730,115 @@ def _coalescing_manager(
+         raise ValueError(
+             "ProcessGroup has non-empty op list at the start of coalescing"
+         )
+-    if device:
+-        group._start_coalescing(device)
++    # [Crystal Patch]
++    # In capture mode, enter the manager scope: reserve the shared comm trace
++    # index and cut the computation span
++    if os.getenv("CRYSTAL_C10D_CAPTURING"):
++        cond_crystal_c10d_start_coalescing(
++            group=group,
++            device_set=device is not None,
++            async_ops=async_ops
++        )
++    # [Crystal Patch]
++    # In profiler mode, cut the computation span at manager entry because the
++    # coalesced kernels are enqueued inside the scope
++    elif os.getenv("ENABLE_CRYSTAL_RUNTIME_PROFILER"):
++        cond_crystal_runtime_profiler_start_coalescing(
++            group=group,
++            async_ops=async_ops,
++        )
++        if device:
++            group._start_coalescing(device)
++    else:
++        if device:
++            group._start_coalescing(device)
+     cm = _CoalescingManager()
+     yield cm
+-    work = None
+-    op_list = _world.pg_coalesce_state.pop(group)
+-    if op_list:
+-        # Collectives supporting "Fast Path" coalescing are captured.
+-        # See implementation in corresponding collective APIs.
+-        # Currently supported:
+-        # - coalesced `all_reduce`
+-        # - coalesced `all_gather_into_tensor`
+-        # - coalesced `reduce_scatter_tensor`
+-        op0 = op_list[0].op
+-        if op0 == all_reduce:
+-            tensors = [op.tensor for op in op_list]
+-            all_reduce_opts = AllreduceCoalescedOptions()
+-            all_reduce_opts.reduceOp = not_none(op_list[0].redop)
+-            all_reduce_opts.asyncOp = async_ops
+-            work = group.allreduce_coalesced(tensors, all_reduce_opts)
+-        elif op0 == all_gather_into_tensor:
+-            inputs = []
+-            outputs = []
+-            for op in op_list:
+-                inputs.append(op.tensor)
+-                outputs.append(not_none(op.dst_tensor))
+-            all_gather_opts = AllgatherOptions()
+-            all_gather_opts.asyncOp = async_ops
+-            work = group.allgather_into_tensor_coalesced(outputs, inputs)
+-        elif op0 == reduce_scatter_tensor:
+-            inputs = []
+-            outputs = []
+-            for op in op_list:
+-                inputs.append(op.tensor)
+-                outputs.append(not_none(op.dst_tensor))
+-            reduce_opts = ReduceScatterOptions()
+-            reduce_opts.reduceOp = not_none(op_list[0].redop)
+-            reduce_opts.asyncOp = async_ops
+-            work = group.reduce_scatter_tensor_coalesced(outputs, inputs, reduce_opts)
++    # [Crystal Patch]
++    # In capture mode, close the manager's comm span on exit and append/wait the
++    # fake work; no real kernel is ever launched
++    if os.getenv("CRYSTAL_C10D_CAPTURING"):
++        work = cond_crystal_c10d_end_coalescing(
++            group=group,
++            device_set=device is not None,
++            async_ops=async_ops
++        )
++        if async_ops:
++            cm.append(work)
+         else:
+-            raise AssertionError(
+-                f"Coalescing manager does not support fast-path coalescing of {op0}, "
+-                f"yet {op0} is still recorded in op list. This is an internal error of c10d."
+-            )
++            work.wait()
++        return
++    # [Crystal Patch]
++    # Kept as one closure so the Crystal runtime profiler can end its coalescing
++    # span before this possibly synchronous launch runs
++    def launch_func():
++        work = None
++        op_list = _world.pg_coalesce_state.pop(group)
++        if op_list:
++            # Collectives supporting "Fast Path" coalescing are captured.
++            # See implementation in corresponding collective APIs.
++            # Currently supported:
++            # - coalesced `all_reduce`
++            # - coalesced `all_gather_into_tensor`
++            # - coalesced `reduce_scatter_tensor`
++            op0 = op_list[0].op
++            if op0 == all_reduce:
++                tensors = [op.tensor for op in op_list]
++                all_reduce_opts = AllreduceCoalescedOptions()
++                all_reduce_opts.reduceOp = not_none(op_list[0].redop)
++                all_reduce_opts.asyncOp = async_ops
++                work = group.allreduce_coalesced(tensors, all_reduce_opts)
++            elif op0 == all_gather_into_tensor:
++                inputs = []
++                outputs = []
++                for op in op_list:
++                    inputs.append(op.tensor)
++                    outputs.append(not_none(op.dst_tensor))
++                all_gather_opts = AllgatherOptions()
++                all_gather_opts.asyncOp = async_ops
++                work = group.allgather_into_tensor_coalesced(outputs, inputs)
++            elif op0 == reduce_scatter_tensor:
++                inputs = []
++                outputs = []
++                for op in op_list:
++                    inputs.append(op.tensor)
++                    outputs.append(not_none(op.dst_tensor))
++                reduce_opts = ReduceScatterOptions()
++                reduce_opts.reduceOp = not_none(op_list[0].redop)
++                reduce_opts.asyncOp = async_ops
++                work = group.reduce_scatter_tensor_coalesced(outputs, inputs, reduce_opts)
++            else:
++                raise AssertionError(
++                    f"Coalescing manager does not support fast-path coalescing of {op0}, "
++                    f"yet {op0} is still recorded in op list. This is an internal error of c10d."
++                )
+ 
+-    if device:
+-        # Old style of letting each coll inside the context manager to call into C++ counterpart via python binding
+-        work = group._end_coalescing(device)
++        if device:
++            # Old style of letting each coll inside the context manager to call into C++ counterpart via python binding
++            work = group._end_coalescing(device)
++
++        # [Crystal Patch]
++        # The synchronous wait runs inside the closure so that the NCCL
++        # completion wait lands on the compute stream before the profiler opens
++        # the next proc span, keeping the span start after the communication
++        if not async_ops and (
++            work is not None
++        ):  # Backward compatible with backends that don't sync at CPP level
++            work.wait()
++        # Otherwise, the backend has sync'ed at CPP level
++
++        return work
+ 
++    if os.getenv("ENABLE_CRYSTAL_RUNTIME_PROFILER"):
++        work = cond_crystal_runtime_profiler_end_coalescing(group, async_ops, launch_func)
++    else:
++        work = launch_func()
++
++    # [Crystal Patch]
++    # Append after the handler returns so profiler async mode stores the
++    # CrystalProfiledWork wrapper, whose wait() drives the wait-side span bracket
+     if async_ops:
+         cm.append(work)
+-    elif (
+-        work is not None
+-    ):  # Backward compatible with backends that don't sync at CPP level
+-        work.wait()
+-    # Otherwise, the backend has sync'ed at CPP level
+ 
+ 
+ class _TimeEstimator:
+@@ -2710,7 +2944,8 @@ def batch_isend_irecv(p2p_op_list: list[P2POp]) -> list[Work]:
+         key = "group_dst" if op.op == isend else "group_src"
+         return {key: op.group_peer}
+ 
+-    if type(group) == ProcessGroup and group._get_backend(device).supports_coalescing:
++    if type(group) == CrystalFakeProcessGroup or (
++        type(group) == ProcessGroup and group._get_backend(device).supports_coalescing):
+         # NCCL style coalescing
+         with _coalescing_manager(group, device, async_ops=True) as cm:
+             for p2p_op in p2p_op_list:
+@@ -2737,6 +2972,9 @@ def batch_isend_irecv(p2p_op_list: list[P2POp]) -> list[Work]:
+         return reqs
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def broadcast(
+     tensor: torch.Tensor,
+@@ -2787,6 +3025,9 @@ def broadcast(
+     # Otherwise, the backend has sync'ed at CPP level
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def all_reduce(tensor, op=ReduceOp.SUM, group=None, async_op=False):
+     """
+@@ -2957,6 +3198,9 @@ def all_reduce_coalesced(tensors, op=ReduceOp.SUM, group=None, async_op=False):
+     # Otherwise, the backend has sync'ed at CPP level
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def reduce(
+     tensor: torch.Tensor,
+@@ -3719,6 +3963,9 @@ def scatter_object_list(
+     )
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def all_gather(tensor_list, tensor, group=None, async_op=False):
+     """
+@@ -3819,6 +4066,9 @@ def all_gather(tensor_list, tensor, group=None, async_op=False):
+     # Otherwise, the backend has sync'ed at CPP level
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False):
+     """
+@@ -3926,6 +4176,9 @@ def all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=Fal
+     # Otherwise, the backend has sync'ed at CPP level
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ @deprecated(
+     "`torch.distributed._all_gather_base` is a private function and will be deprecated. "
+@@ -4058,6 +4311,9 @@ def _validate_output_list_for_rank(my_rank, dst, gather_list):
+         )
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def gather(
+     tensor: torch.Tensor,
+@@ -4141,6 +4397,9 @@ def gather(
+     # Otherwise, the backend has sync'ed at CPP level
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def scatter(
+     tensor: torch.Tensor,
+@@ -4246,6 +4505,9 @@ def scatter(
+     # Otherwise, the backend has sync'ed at CPP level
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def reduce_scatter(output, input_list, op=ReduceOp.SUM, group=None, async_op=False):
+     """
+@@ -4289,6 +4551,9 @@ def reduce_scatter(output, input_list, op=ReduceOp.SUM, group=None, async_op=Fal
+     # Otherwise, the backend has sync'ed at CPP level
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def reduce_scatter_tensor(output, input, op=ReduceOp.SUM, group=None, async_op=False):
+     """
+@@ -4390,6 +4655,9 @@ def reduce_scatter_tensor(output, input, op=ReduceOp.SUM, group=None, async_op=F
+     # Otherwise, the backend has sync'ed at CPP level
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @deprecated(
+     "`torch.distributed._reduce_scatter_base` is a private function and will be deprecated. "
+     "Please use `torch.distributed.reduce_scatter_tensor` instead.",
+@@ -4418,6 +4686,9 @@ def _reduce_scatter_base(output, input, op=ReduceOp.SUM, group=None, async_op=Fa
+     return reduce_scatter_tensor(output, input, op, group, async_op)
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def all_to_all_single(
+     output,
+@@ -4567,6 +4838,9 @@ def all_to_all_single(
+     # Otherwise, the backend has sync'ed at CPP level
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def all_to_all(output_tensor_list, input_tensor_list, group=None, async_op=False):
+     """
+@@ -4689,6 +4963,9 @@ def all_to_all(output_tensor_list, input_tensor_list, group=None, async_op=False
+     # Otherwise, the backend has sync'ed at CPP level
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def barrier(
+     group: Optional[ProcessGroup] = GroupMember.WORLD, async_op=False, device_ids=None
+@@ -4738,6 +5015,9 @@ def barrier(
+     # Otherwise, the backend has sync'ed at CPP level
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ def monitored_barrier(
+     group: Optional[ProcessGroup] = GroupMember.WORLD,
+     timeout=None,
+@@ -5160,16 +5440,91 @@ def new_group(
+     multiple overlaping process groups. To avoid that, make sure all ranks follow the
+     same global creation order.
+     """
+-    return _new_group_with_tag(
+-        ranks,
+-        timeout,
+-        backend,
+-        pg_options,
+-        None,
+-        use_local_synchronization=use_local_synchronization,
+-        group_desc=group_desc,
+-        device_id=device_id,
+-    )
++    # [Crystal Patch]
++    # If communication capturing is enabled, new_group will be bypassed
++    # and a _FakeProcessGroup will be created.
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        # Copied from _new_group_with_tag()
++        global_rank = get_rank()
++        global_world_size = get_world_size()
++        if ranks is not None:
++            ranks = sorted(ranks)
++            group_world_size = len(ranks)
++            if group_world_size > global_world_size:
++                raise ValueError(
++                    "the new group's world size should be less or "
++                    "equal to the world size set by "
++                    "init_process_group"
++                )
++            # check ranks' sanity
++            for rank in ranks:
++                if rank < 0 or rank >= global_world_size:
++                    raise ValueError(
++                        "The new group's rank should be within "
++                        "the world_size set by init_process_group"
++                    )
++            if global_rank in ranks:
++                group_rank = ranks.index(global_rank)
++            else:
++                group_rank = None
++        else:
++            ranks = list(range(global_world_size))
++            group_world_size = global_world_size
++            group_rank = global_rank
++        group_name = _process_group_name(ranks, use_hashed_name=use_local_synchronization)
++        # If the rank is in the ranks list, return a fake process group. Otherwise,
++        # return GroupMember.NON_GROUP_MEMBER as _new_process_group_helper() did
++        if global_rank in ranks:
++            pg = CrystalFakeProcessGroup(
++                ranks,
++                group_rank,
++                group_name,
++                group_desc
++            )
++        else:
++            pg = GroupMember.NON_GROUP_MEMBER
++        cond_custom_write_crystal_c10d_trace("NEW_GROUP", str({
++            "ranks": ranks,
++            "timeout": timeout,
++            "backend": backend,
++            "group_name": group_name,
++            "group_desc": group_desc,
++        }))
++        # Copied from _new_group_with_tag()
++        _world.pg_group_ranks[pg] = {
++            global_rank: group_rank for group_rank, global_rank in enumerate(ranks)
++        }
++        if pg != GroupMember.NON_GROUP_MEMBER:
++            _world.pg_names[pg] = group_name
++        return pg
++    else:
++        # Skip creation of groups without intersection with sandbox ranks when using mock NCCL
++        if os.getenv('CRYSTAL_MOCK_NCCL_SANDBOX_RANKS') is not None:
++            sandbox_ranks_set = {int(r.strip()) for r in os.getenv('CRYSTAL_MOCK_NCCL_SANDBOX_RANKS').split(',') if r.strip()}
++            # If ranks is None, ranks is all ranks
++            if ranks is not None:
++                ranks_set = set(ranks)
++                if not (ranks_set & sandbox_ranks_set):
++                    # Copied from _new_group_with_tag()
++                    group_name = _process_group_name(ranks, use_hashed_name=use_local_synchronization)
++                    # return GroupMember.NON_GROUP_MEMBER as _new_process_group_helper() did
++                    pg = GroupMember.NON_GROUP_MEMBER
++                    # Copied from _new_group_with_tag()
++                    _world.pg_group_ranks[pg] = {
++                        global_rank: group_rank for group_rank, global_rank in enumerate(ranks)
++                    }
++                    return pg
++
++        return _new_group_with_tag(
++            ranks,
++            timeout,
++            backend,
++            pg_options,
++            None,
++            use_local_synchronization=use_local_synchronization,
++            group_desc=group_desc,
++            device_id=device_id,
++        )
+ 
+ 
+ def _new_group_with_tag(

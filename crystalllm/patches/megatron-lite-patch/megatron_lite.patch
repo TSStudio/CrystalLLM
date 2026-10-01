@@ -1,0 +1,738 @@
+diff --git a/experimental/lite/megatron/lite/primitive/modules/dispatcher.py b/experimental/lite/megatron/lite/primitive/modules/dispatcher.py
+index 10a63536ec70bca920bc321a82426d0a0935ac9b..b3f972fb28b4ea5e8753a1be0043ea1eae1aca70 100644
+--- a/experimental/lite/megatron/lite/primitive/modules/dispatcher.py
++++ b/experimental/lite/megatron/lite/primitive/modules/dispatcher.py
+@@ -8,6 +8,7 @@ import os
+ import torch  # pyright: ignore[reportMissingImports]
+ import torch.distributed as dist  # pyright: ignore[reportMissingImports]
+ 
++from megatron.crystal_utils import is_crystal_mode_enabled
+ from megatron.lite.primitive.modules.moe import _AllToAll
+ from megatron.lite.primitive.parallel import ParallelState
+ from megatron.lite.primitive.utils import ensure_divisible
+@@ -355,7 +356,12 @@ class TokenDispatcher:
+         self._input_splits = tpe_by_rank.tolist()
+ 
+         global_tpe_flat = tokens_per_expert.new_empty(self.ep_size * e)
+-        dist.all_gather_into_tensor(global_tpe_flat, tokens_per_expert, group=self.ps.ep_group)
++        if is_crystal_mode_enabled():
++            from crystalllm.integration.megatron_lite import all_gather_ep_token_counts
++
++            all_gather_ep_token_counts(global_tpe_flat, tokens_per_expert, self.ps.ep_group)
++        else:
++            dist.all_gather_into_tensor(global_tpe_flat, tokens_per_expert, group=self.ps.ep_group)
+         global_tpe_2d = global_tpe_flat.view(self.ep_size, e)
+         ep_rank = dist.get_rank(group=self.ps.ep_group)
+         my_start = ep_rank * self.num_local_experts
+diff --git a/experimental/lite/megatron/lite/primitive/optimizers/megatron_wrap.py b/experimental/lite/megatron/lite/primitive/optimizers/megatron_wrap.py
+index 8545a07d22dffcb023d5efeff6c7e5987a9ccf15..5550056c0841c3eb99b7142fbd891b956e2e1f69 100644
+--- a/experimental/lite/megatron/lite/primitive/optimizers/megatron_wrap.py
++++ b/experimental/lite/megatron/lite/primitive/optimizers/megatron_wrap.py
+@@ -10,6 +10,7 @@ from typing import Any
+ import torch  # pyright: ignore[reportMissingImports]
+ import torch.nn as nn  # pyright: ignore[reportMissingImports]
+ 
++from megatron.crystal_utils import is_crystal_mode_enabled
+ from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
+ 
+ 
+@@ -56,7 +57,12 @@ def _ensure_dist_opt_mpu_parallel_state(engine_cfg) -> None:
+         context_parallel_size=p.cp,
+         expert_model_parallel_size=p.ep,
+         expert_tensor_parallel_size=_effective_etp(p),
+-        create_gloo_process_groups=bool(getattr(engine_cfg, "deterministic", False)),
++        # Crystal planning omits logical ranks absent from the sandbox, so real
++        # optimizer Gloo groups would hang. They only serve checkpoint metadata.
++        create_gloo_process_groups=(
++            bool(getattr(engine_cfg, "deterministic", False))
++            and not is_crystal_mode_enabled()
++        ),
+     )
+ 
+ 
+@@ -180,7 +186,11 @@ def build_dist_opt_stack(
+     # groups. Long term, this primitive should always pass its own
+     # `pg_collection`.
+     if skip_ddp_wrap or use_mpu_groups:
+-        optimizer = get_megatron_optimizer(config=opt_config, model_chunks=wrapped_chunks)
++        optimizer = get_megatron_optimizer(
++            config=opt_config,
++            model_chunks=wrapped_chunks,
++            use_gloo_process_groups=not is_crystal_mode_enabled(),
++        )
+         optimizer._dist_opt_pg_collection = None  # pyright: ignore[reportAttributeAccessIssue]
+     else:
+         optimizer = get_megatron_optimizer(
+diff --git a/experimental/lite/megatron/lite/primitive/parallel/pipeline.py b/experimental/lite/megatron/lite/primitive/parallel/pipeline.py
+index 8cbc775867f9a12217a56c1fca0b08e2d43baea1..fcd23e55caee2c0e27d50e90876060347b5bb96b 100644
+--- a/experimental/lite/megatron/lite/primitive/parallel/pipeline.py
++++ b/experimental/lite/megatron/lite/primitive/parallel/pipeline.py
+@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
+ import torch  # pyright: ignore[reportMissingImports]
+ import torch.distributed as dist  # pyright: ignore[reportMissingImports]
+ 
++from megatron.crystal_utils import is_crystal_mode_enabled
+ from megatron.lite.primitive.utils import ensure_divisible
+ from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
+ 
+@@ -281,9 +282,8 @@ def _1f1b_schedule(
+         if ps.pp_is_last:
+             if loss_t is not None:
+                 loss_t.backward()
+-        else:
+-            if hid_t is not None and hid_t.requires_grad:
+-                torch.autograd.backward(hid_t, grad_t)
++        elif hid_t is not None and hid_t.requires_grad:
++            torch.autograd.backward(hid_t, grad_t)
+         return inp_t.grad if inp_t is not None else None
+ 
+     def _p2p(send_fwd=None, send_bwd=None, recv_fwd=False, recv_bwd=False):
+@@ -547,6 +547,12 @@ def _send_recv_pipeline(
+     _dbg = int(os.environ.get("MEGATRON_LITE_PP_DEBUG", "0"))
+     rank = dist.get_rank()
+ 
++    # Crystal capture does not transfer remote shape metadata. Fixed-shape Lite
++    # pretraining already supplies the nominal [S, B, H] shape, so use it for
++    # capture and replay instead of interpreting an uninitialized P2P buffer.
++    if dynamic_shape and is_crystal_mode_enabled():
++        dynamic_shape = False
++
+     ops: list[dist.P2POp] = []
+     fwd_buf: torch.Tensor | None = None
+     bwd_buf: torch.Tensor | None = None
+diff --git a/experimental/lite/megatron/lite/primitive/parallel/state.py b/experimental/lite/megatron/lite/primitive/parallel/state.py
+index c92541b27ad78fc907ba3276a3db9951870519ee..497b67c77e706e85c09cc2cb2951e811e5d73c73 100644
+--- a/experimental/lite/megatron/lite/primitive/parallel/state.py
++++ b/experimental/lite/megatron/lite/primitive/parallel/state.py
+@@ -7,9 +7,20 @@ from dataclasses import dataclass
+ 
+ import torch.distributed as dist  # pyright: ignore[reportMissingImports]
+ 
++from megatron.crystal_utils import crystal_group_desc, is_crystal_mode_enabled
+ from megatron.lite.primitive.utils import ensure_divisible
+ 
+ 
++def _new_group(ranks: list[int], tag: str, backend: str | None = None):
++    """Create a descriptively named group for deterministic trace replay."""
++    if not is_crystal_mode_enabled():
++        if backend is None:
++            return dist.new_group(ranks)
++        return dist.new_group(ranks, backend=backend)
++    group_desc = crystal_group_desc(tag, backend)
++    return dist.new_group(ranks, backend=backend, group_desc=group_desc)
++
++
+ @dataclass
+ class ParallelState:
+     tp_group: dist.ProcessGroup | None = None
+@@ -112,7 +123,7 @@ def init_parallel(config) -> ParallelState:
+         for p in range(pp):
+             for c in range(cp):
+                 ranks = [_d(t, c, d, p) for t in range(tp)]
+-                g = dist.new_group(ranks)
++                g = _new_group(ranks, "TENSOR")
+                 if rank in ranks:
+                     ps.tp_group = g
+ 
+@@ -120,7 +131,7 @@ def init_parallel(config) -> ParallelState:
+         for p in range(pp):
+             for t in range(tp):
+                 ranks = [_d(t, c, d, p) for c in range(cp)]
+-                g = dist.new_group(ranks)
++                g = _new_group(ranks, "CONTEXT")
+                 if rank in ranks:
+                     ps.cp_group = g
+                     ps.cp_global_ranks = ranks
+@@ -129,11 +140,14 @@ def init_parallel(config) -> ParallelState:
+         for c in range(cp):
+             for t in range(tp):
+                 ranks = [_d(t, c, d, p) for p in range(pp)]
+-                g = dist.new_group(ranks)
+-                try:
+-                    cpu_g = dist.new_group(ranks, backend="gloo")
+-                except (RuntimeError, ValueError):
++                g = _new_group(ranks, "PIPELINE")
++                if is_crystal_mode_enabled():
+                     cpu_g = None
++                else:
++                    try:
++                        cpu_g = _new_group(ranks, "PIPELINE_CPU", backend="gloo")
++                    except (RuntimeError, ValueError):
++                        cpu_g = None
+                 if rank in ranks:
+                     ps.pp_group = g
+                     ps.pp_cpu_group = cpu_g
+@@ -143,14 +157,14 @@ def init_parallel(config) -> ParallelState:
+         for c in range(cp):
+             for t in range(tp):
+                 ranks = [_d(t, c, d, p) for d in range(dense_dp)]
+-                g = dist.new_group(ranks)
++                g = _new_group(ranks, "DATA")
+                 if rank in ranks:
+                     ps.dp_group = g
+ 
+     for p in range(pp):
+         for t in range(tp):
+             ranks = [_d(t, c, d, p) for d in range(dense_dp) for c in range(cp)]
+-            g = dist.new_group(ranks)
++            g = _new_group(ranks, "DATA_CONTEXT")
+             if rank in ranks:
+                 ps.dp_cp_group = g
+ 
+@@ -158,7 +172,7 @@ def init_parallel(config) -> ParallelState:
+         for p in range(pp):
+             for t in range(etp):
+                 ranks = [_e(t, e, d, p) for e in range(ep)]
+-                g = dist.new_group(ranks)
++                g = _new_group(ranks, "EXPERT")
+                 if rank in ranks:
+                     ps.ep_group = g
+ 
+@@ -167,14 +181,14 @@ def init_parallel(config) -> ParallelState:
+             for p in range(pp):
+                 for e in range(ep):
+                     ranks = [_e(t, e, d, p) for t in range(etp)]
+-                    g = dist.new_group(ranks)
++                    g = _new_group(ranks, "EXPERT_TENSOR")
+                     if rank in ranks:
+                         ps.etp_group = g
+ 
+     for d in range(expert_dp):
+         for p in range(pp):
+             ranks = [_e(t, e, d, p) for e in range(ep) for t in range(etp)]
+-            g = dist.new_group(ranks)
++            g = _new_group(ranks, "TENSOR_EXPERT")
+             if rank in ranks:
+                 ps.tp_ep_group = g
+ 
+@@ -182,7 +196,7 @@ def init_parallel(config) -> ParallelState:
+         for e in range(ep):
+             for t in range(etp):
+                 ranks = [_e(t, e, d, p) for d in range(expert_dp)]
+-                g = dist.new_group(ranks)
++                g = _new_group(ranks, "EXPERT_DATA")
+                 if rank in ranks:
+                     ps.ep_dp_group = g
+ 
+diff --git a/experimental/lite/megatron/lite/primitive/train_step.py b/experimental/lite/megatron/lite/primitive/train_step.py
+index 88eeb89694598ca514041d034df3750245230d2e..6b206fb822ff651e229bf3be67014cfb7b97bdf7 100644
+--- a/experimental/lite/megatron/lite/primitive/train_step.py
++++ b/experimental/lite/megatron/lite/primitive/train_step.py
+@@ -7,6 +7,7 @@ from collections.abc import Callable
+ 
+ import torch
+ import torch.distributed as dist
++
+ from megatron.lite.primitive.parallel import ParallelState
+ from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
+ from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
+diff --git a/experimental/lite/megatron/lite/runtime/backends/mlite/runtime.py b/experimental/lite/megatron/lite/runtime/backends/mlite/runtime.py
+index 2f81d2109514a2816d8d2e13c7dd3829ae11465e..8c270a88d251e0fe37a2b878cdae3caa5b177be2 100644
+--- a/experimental/lite/megatron/lite/runtime/backends/mlite/runtime.py
++++ b/experimental/lite/megatron/lite/runtime/backends/mlite/runtime.py
+@@ -14,6 +14,7 @@ from typing import Any
+ import torch
+ import torch.distributed as dist
+ 
++from megatron.crystal_utils import is_crystal_mode_enabled
+ from megatron.lite.runtime.backends import Runtime as RuntimeBase
+ from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
+ from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
+@@ -25,6 +26,19 @@ from megatron.lite.runtime.contracts.loss import (
+ )
+ 
+ 
++def _load_crystal_hooks():
++    """Load Crystal hooks only for explicit capture or emulation runs."""
++    if not is_crystal_mode_enabled():
++        return None
++    try:
++        from crystalllm.integration import megatron_lite as hooks
++    except ImportError as exc:
++        raise RuntimeError(
++            "CRYSTAL_MODE requires the crystalllm package to be installed"
++        ) from exc
++    return hooks
++
++
+ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
+     """Construct typed impl config, backfilling hf_path + optimizer_config."""
+     init_fields = {f.name for f in dc_fields(proto.ImplConfig) if f.init}
+@@ -189,6 +203,7 @@ class MegatronLiteRuntime(RuntimeBase):
+         cfg: MegatronLiteConfig | dict[str, Any] | None = None,
+         **kwargs,
+     ) -> ModelHandle:
++        crystal_hooks = _load_crystal_hooks()
+         if cfg is not None and isinstance(cfg, dict):
+             rt_cfg = MegatronLiteConfig.from_dict(hf_path or self._hf_path, cfg)
+         elif cfg is not None and isinstance(cfg, MegatronLiteConfig):
+@@ -196,9 +211,25 @@ class MegatronLiteRuntime(RuntimeBase):
+         else:
+             rt_cfg = self._cfg
+ 
++        if crystal_hooks is not None:
++            impl_cfg = getattr(rt_cfg, "impl_cfg", {}) or {}
++            if bool(impl_cfg.get("use_thd", False)):
++                raise NotImplementedError(
++                    "Crystal mode does not support Megatron Lite THD; set use_thd=False."
++                )
++            crystal_hooks.initialize()
++
+         # ── init distributed ──
+         if not dist.is_initialized():
+-            dist.init_process_group("nccl", timeout=timedelta(minutes=10))
++            init_kwargs = {}
++            if crystal_hooks is not None:
++                # Crystal's capture backend bypasses the env:// rendezvous, so
++                # it cannot resolve PyTorch's sentinel rank/world-size values.
++                init_kwargs = {
++                    "rank": int(os.environ["RANK"]),
++                    "world_size": int(os.environ["WORLD_SIZE"]),
++                }
++            dist.init_process_group("nccl", timeout=timedelta(minutes=10), **init_kwargs)
+         torch.cuda.set_device(dist.get_rank() % torch.cuda.device_count())
+         torch.cuda.manual_seed(42)
+ 
+@@ -459,6 +490,9 @@ class MegatronLiteRuntime(RuntimeBase):
+         from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+ 
+         forward_step = handle._extras["forward_step"]
++        crystal_hooks = _load_crystal_hooks()
++        if crystal_hooks is not None:
++            crystal_hooks.step_start()
+         if num_microbatches < 1:
+             raise ValueError("num_microbatches must be >= 1")
+ 
+@@ -490,6 +524,10 @@ class MegatronLiteRuntime(RuntimeBase):
+             # exchange (the sender transmits its real per-micro-batch size), so THD
+             # variable-length packing no longer needs a locally-derived shape.
+             tensor_shape = _infer_pipeline_tensor_shape(first_batch, model_cfg, ps)
++            if crystal_hooks is not None:
++                tensor_shape = crystal_hooks.non_thd_pipeline_tensor_shape(
++                    first_batch, tensor_shape, ps
++                )
+ 
+             model_chunks = handle._extras.get("model_chunks", [handle._model])
+             pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
+@@ -554,6 +592,9 @@ class MegatronLiteRuntime(RuntimeBase):
+             for key, value in row.items():
+                 metrics.setdefault(key, []).append(value)
+ 
++        if crystal_hooks is not None and (forward_only or handle._optimizer is None):
++            crystal_hooks.step_stop()
++
+         return ForwardResult(
+             model_output=ModelOutputs(
+                 loss=loss_tensor,
+@@ -576,10 +617,15 @@ class MegatronLiteRuntime(RuntimeBase):
+             handle._optimizer.zero_grad()
+ 
+     def optimizer_step(self, handle: ModelHandle) -> tuple[bool, float, int | None]:
+-        if handle._optimizer is None:
+-            return True, 0.0, 0
+-        update_successful, grad_norm, num_zeros = handle._optimizer.step()
+-        return update_successful, float(grad_norm), num_zeros
++        crystal_hooks = _load_crystal_hooks()
++        try:
++            if handle._optimizer is None:
++                return True, 0.0, 0
++            update_successful, grad_norm, num_zeros = handle._optimizer.step()
++            return update_successful, float(grad_norm), num_zeros
++        finally:
++            if crystal_hooks is not None:
++                crystal_hooks.step_stop()
+ 
+     def lr_scheduler_step(self, handle: ModelHandle) -> float | list[float]:
+         if handle._lr_scheduler is not None:
+diff --git a/experimental/lite/tests/unit/primitive/optimizers/test_dist_opt_validation.py b/experimental/lite/tests/unit/primitive/optimizers/test_dist_opt_validation.py
+index ffe9b112020afd9e135bf0de68a551669a0a140a..27b7782725f364fe813809553f543d48d55f847f 100644
+--- a/experimental/lite/tests/unit/primitive/optimizers/test_dist_opt_validation.py
++++ b/experimental/lite/tests/unit/primitive/optimizers/test_dist_opt_validation.py
+@@ -1,9 +1,14 @@
+ # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ from __future__ import annotations
+ 
++from types import SimpleNamespace
++from unittest.mock import patch
++
+ import pytest
+ 
+ from megatron.lite.primitive.optimizers.megatron_wrap import (
++    _ensure_dist_opt_mpu_parallel_state,
++    build_dist_opt_stack,
+     validate_dist_opt_config,
+     validate_dist_opt_session,
+ )
+@@ -27,3 +32,73 @@ def test_dist_opt_validation_keeps_vpp_parallel_constraint():
+ def test_validate_dist_opt_session_alias_matches_config_validator():
+     assert validate_dist_opt_session is validate_dist_opt_config
+     validate_dist_opt_session(_engine_cfg(model_name="another_synthetic_model", pp=2, vpp=2))
++
++
++@pytest.mark.parametrize(
++    ("crystal_mode", "expected_gloo"),
++    [(None, True), ("CAPTURE", False), ("EMULATE", False)],
++)
++def test_dist_opt_mpu_omits_gloo_groups_only_for_crystal(
++    monkeypatch, crystal_mode, expected_gloo
++):
++    from megatron.core import parallel_state as mpu
++
++    if crystal_mode is None:
++        monkeypatch.delenv("CRYSTAL_MODE", raising=False)
++    else:
++        monkeypatch.setenv("CRYSTAL_MODE", crystal_mode)
++
++    parallel = SimpleNamespace(tp=1, ep=8, etp=1, pp=4, cp=1, vpp=1)
++    engine_cfg = SimpleNamespace(parallel=parallel, deterministic=True)
++    with (
++        patch.object(mpu, "is_initialized", return_value=False),
++        patch.object(mpu, "initialize_model_parallel") as initialize,
++    ):
++        _ensure_dist_opt_mpu_parallel_state(engine_cfg)
++
++    assert initialize.call_args.kwargs["create_gloo_process_groups"] is expected_gloo
++
++
++@pytest.mark.parametrize(
++    ("crystal_mode", "expected_gloo"),
++    [(None, True), ("CAPTURE", False), ("EMULATE", False)],
++)
++def test_dist_opt_disables_optimizer_gloo_only_for_crystal(
++    monkeypatch, crystal_mode, expected_gloo
++):
++    if crystal_mode is None:
++        monkeypatch.delenv("CRYSTAL_MODE", raising=False)
++    else:
++        monkeypatch.setenv("CRYSTAL_MODE", crystal_mode)
++
++    parallel = SimpleNamespace(tp=1, ep=8, etp=1, pp=4, cp=1, vpp=1)
++    engine_cfg = SimpleNamespace(parallel=parallel, optimizer=object(), deterministic=True)
++    optimizer = SimpleNamespace()
++    with (
++        patch(
++            "megatron.lite.primitive.optimizers.megatron_wrap._build_transformer_config",
++            return_value=SimpleNamespace(),
++        ),
++        patch(
++            "megatron.lite.primitive.optimizers.megatron_wrap."
++            "build_dist_opt_optimizer_config",
++            return_value=object(),
++        ),
++        patch(
++            "megatron.lite.primitive.optimizers.megatron_wrap."
++            "_ensure_dist_opt_mpu_parallel_state"
++        ),
++        patch(
++            "megatron.core.optimizer.get_megatron_optimizer", return_value=optimizer
++        ) as get_optimizer,
++    ):
++        _, result = build_dist_opt_stack(
++            [object()],
++            model_cfg=object(),
++            engine_cfg=engine_cfg,
++            ps=object(),
++            skip_ddp_wrap=True,
++        )
++
++    assert result is optimizer
++    assert get_optimizer.call_args.kwargs["use_gloo_process_groups"] is expected_gloo
+diff --git a/experimental/lite/tests/unit/runtime/backends/mlite/test_runtime_backend_unit.py b/experimental/lite/tests/unit/runtime/backends/mlite/test_runtime_backend_unit.py
+index 4a4659547baa007c219eaeee4bcbe504d250681f..fdb9edbbf285a455c17990219ec71b854cc0b7e2 100644
+--- a/experimental/lite/tests/unit/runtime/backends/mlite/test_runtime_backend_unit.py
++++ b/experimental/lite/tests/unit/runtime/backends/mlite/test_runtime_backend_unit.py
+@@ -5,6 +5,7 @@ import os
+ import sys
+ import types
+ from dataclasses import dataclass
++from datetime import timedelta
+ from unittest.mock import MagicMock, patch
+ 
+ import pytest
+@@ -61,6 +62,113 @@ def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
+     assert metrics == {"batch": "presplit", "source": "source"}
+ 
+ 
++@pytest.mark.parametrize("crystal_enabled", [False, True])
++def test_build_model_initializes_distributed_for_crystal(monkeypatch, crystal_enabled):
++    """Crystal supplies explicit rank metadata without changing Lite's timeout."""
++
++    class StopAfterInit(Exception):
++        pass
++
++    hooks = MagicMock() if crystal_enabled else None
++    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
++    runtime._cfg = object()
++    monkeypatch.setattr(
++        "megatron.lite.runtime.backends.mlite.runtime._load_crystal_hooks",
++        lambda: hooks,
++    )
++    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
++    monkeypatch.setenv("RANK", "0")
++    monkeypatch.setenv("WORLD_SIZE", "8")
++
++    def init_process_group(backend, *, timeout, **kwargs):
++        assert backend == "nccl"
++        assert timeout == timedelta(minutes=10)
++        assert kwargs == ({"rank": 0, "world_size": 8} if crystal_enabled else {})
++        raise StopAfterInit
++
++    monkeypatch.setattr(torch.distributed, "init_process_group", init_process_group)
++
++    with pytest.raises(StopAfterInit):
++        runtime.build_model()
++
++    if hooks is not None:
++        hooks.initialize.assert_called_once_with()
++
++
++def test_build_model_rejects_thd_for_crystal(monkeypatch):
++    hooks = MagicMock()
++    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
++    runtime._cfg = types.SimpleNamespace(impl_cfg={"use_thd": True})
++    init_process_group = MagicMock()
++    monkeypatch.setattr(
++        "megatron.lite.runtime.backends.mlite.runtime._load_crystal_hooks",
++        lambda: hooks,
++    )
++    monkeypatch.setattr(torch.distributed, "init_process_group", init_process_group)
++
++    with pytest.raises(NotImplementedError, match="does not support Megatron Lite THD"):
++        runtime.build_model()
++
++    hooks.initialize.assert_not_called()
++    init_process_group.assert_not_called()
++
++
++@pytest.mark.parametrize("forward_only", [False, True])
++@pytest.mark.parametrize("has_optimizer", [False, True])
++def test_crystal_step_covers_optimizer_communication(monkeypatch, forward_only, has_optimizer):
++    events = []
++    hooks = MagicMock()
++    hooks.step_start.side_effect = lambda: events.append("start")
++    hooks.step_stop.side_effect = lambda: events.append("stop")
++    monkeypatch.setattr(
++        "megatron.lite.runtime.backends.mlite.runtime._load_crystal_hooks", lambda: hooks
++    )
++    monkeypatch.setattr(
++        "megatron.lite.primitive.train_step.run_microbatch_loop",
++        lambda *args, **kwargs: events.append("forward_backward") or {},
++    )
++    optimizer = MagicMock()
++    optimizer.step.side_effect = lambda: events.append("optimizer") or (True, 1.0, 0)
++    handle = ModelHandle(
++        model=nn.Linear(1, 1),
++        parallel_state=types.SimpleNamespace(pp_size=1),
++        _extras={
++            "forward_step": lambda *args: {},
++            "finalize_grads": lambda: events.append("finalize_grads"),
++        },
++    )
++    handle._optimizer = optimizer if has_optimizer else None
++    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
++    runtime.forward_backward(handle, [], None, forward_only=forward_only)
++    if forward_only:
++        assert events == ["start", "forward_backward", "stop"]
++        optimizer.step.assert_not_called()
++    elif not has_optimizer:
++        assert events == ["start", "forward_backward", "finalize_grads", "stop"]
++    else:
++        assert events == ["start", "forward_backward", "finalize_grads"]
++        assert runtime.optimizer_step(handle) == (True, 1.0, 0)
++        assert events == ["start", "forward_backward", "finalize_grads", "optimizer", "stop"]
++
++
++@pytest.mark.parametrize("has_optimizer", [False, True])
++def test_crystal_optimizer_exit_closes_step(monkeypatch, has_optimizer):
++    hooks = MagicMock()
++    monkeypatch.setattr(
++        "megatron.lite.runtime.backends.mlite.runtime._load_crystal_hooks", lambda: hooks
++    )
++    optimizer = MagicMock()
++    optimizer.step.side_effect = RuntimeError("optimizer failed")
++    handle = types.SimpleNamespace(_optimizer=optimizer if has_optimizer else None)
++    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
++    if has_optimizer:
++        with pytest.raises(RuntimeError, match="optimizer failed"):
++            runtime.optimizer_step(handle)
++    else:
++        assert runtime.optimizer_step(handle) == (True, 0.0, 0)
++    hooks.step_stop.assert_called_once_with()
++
++
+ def test_runtime_config_defaults_to_mlite_backend():
+     cfg = RuntimeConfig()
+ 
+diff --git a/experimental/lite/tests/unit/test_crystal_utils.py b/experimental/lite/tests/unit/test_crystal_utils.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..193659615243b31a9728c38490b8df06dbdec9fb
+--- /dev/null
++++ b/experimental/lite/tests/unit/test_crystal_utils.py
+@@ -0,0 +1,16 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++from __future__ import annotations
++
++import torch.distributed as dist
++from megatron.crystal_utils import crystal_group_desc
++
++
++def test_crystal_group_desc_is_unique_only_in_crystal(monkeypatch):
++    monkeypatch.delenv("CRYSTAL_MODE", raising=False)
++    assert crystal_group_desc("PIPELINE") == "PIPELINE"
++
++    monkeypatch.setenv("CRYSTAL_MODE", "EMULATE")
++    monkeypatch.setattr(dist, "get_rank", lambda: 7)
++    monkeypatch.setattr(dist, "get_pg_count", lambda: 42)
++
++    assert crystal_group_desc("PIPELINE", "nccl") == "PIPELINE-7-42-nccl"
+diff --git a/megatron/core/optimizer/__init__.py b/megatron/core/optimizer/__init__.py
+index 3e1dde9981dea2127d8a1203e7eb3269cf59fee5..dc5cd4f121acf38881694852ebb73c78ac39abfa 100644
+--- a/megatron/core/optimizer/__init__.py
++++ b/megatron/core/optimizer/__init__.py
+@@ -56,6 +56,7 @@ from megatron.core.optimizer_param_scheduler import (
+ )
+ from megatron.core.process_groups_config import ProcessGroupCollection
+ from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
++from megatron.crystal_utils import is_crystal_mode_enabled
+ 
+ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
+ from ..transformer.module import MegatronModule
+@@ -361,8 +362,14 @@ def _get_param_groups(
+     # so we need to align the param groups across ranks, otherwise we may have
+     # runtime error when loading the checkpoint or numerical error when resuming training.
+     params_key = list(params_map.keys())
+-    gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
+-    torch.distributed.all_gather_object(gathered_params_key, params_key)
++    if is_crystal_mode_enabled():
++        # Crystal fake groups cannot run Python object collectives. This union
++        # is only needed when saving or resuming distributed checkpoints, which
++        # the capture and emulate benchmark does not perform.
++        gathered_params_key = [params_key]
++    else:
++        gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
++        torch.distributed.all_gather_object(gathered_params_key, params_key)
+     for keys in gathered_params_key:
+         for key in keys:
+             if key not in params_key:
+diff --git a/megatron/core/parallel_state.py b/megatron/core/parallel_state.py
+index 70234884ba1f7e50121d78f56474d274a40f4230..ee0d21dd4265d16c5a8e11dbaac90df95fa92961 100644
+--- a/megatron/core/parallel_state.py
++++ b/megatron/core/parallel_state.py
+@@ -13,6 +13,7 @@ import numpy as np
+ import torch
+ 
+ from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
++from megatron.crystal_utils import crystal_group_desc
+ 
+ from .utils import GlobalMemoryBuffer, is_torch_min_version
+ 
+@@ -219,6 +220,7 @@ def create_group(
+     group_desc=None,
+ ):
+     """Creates a ProcessGroup."""
++    group_desc = crystal_group_desc(group_desc, backend)
+     kwargs = {
+         "ranks": ranks,
+         "timeout": timeout,
+diff --git a/megatron/crystal_utils.py b/megatron/crystal_utils.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..abd2435b9652b8a3c62200a8fa8fa7273d85d120
+--- /dev/null
++++ b/megatron/crystal_utils.py
+@@ -0,0 +1,26 @@
++# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++
++"""Helpers for optional Crystal execution modes."""
++
++import os
++
++_CRYSTAL_MODES = frozenset({"CAPTURE", "EMULATE"})
++
++
++def is_crystal_mode_enabled() -> bool:
++    """Return whether this process is running in a Crystal execution mode."""
++    return os.environ.get("CRYSTAL_MODE") in _CRYSTAL_MODES
++
++
++def crystal_group_desc(group_desc: str | None, backend: str | None = None) -> str | None:
++    """Make a process-group description unique during Crystal replay."""
++    if not is_crystal_mode_enabled():
++        return group_desc
++
++    import torch.distributed as dist
++
++    suffix = f"{dist.get_rank()}-{dist.get_pg_count()}-{backend or 'nccl'}"
++    return f"{group_desc}-{suffix}" if group_desc is not None else suffix
++
++
++__all__ = ["crystal_group_desc", "is_crystal_mode_enabled"]
+diff --git a/tests/unit_tests/test_optimizer.py b/tests/unit_tests/test_optimizer.py
+index 5b3e69c23b83326f62f4961aaef17b1daeaff4e8..524cdccc3e2c0755730cdd64c39b9e1cec8a2e52 100644
+--- a/tests/unit_tests/test_optimizer.py
++++ b/tests/unit_tests/test_optimizer.py
+@@ -99,6 +99,18 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
+     assert pg0['min_lr'] is None  # from the optimizer config default.
+ 
+ 
++@patch.dict('os.environ', {'CRYSTAL_MODE': 'CAPTURE'})
++@patch('torch.distributed.all_gather_object', side_effect=AssertionError)
++def test_get_param_groups_skips_object_collective_during_crystal_capture(mock_all_gather):
++    """Crystal logical ranks cannot participate in Python object collectives."""
++    net = Net()
++
++    param_groups = _get_param_groups([net], OptimizerConfig(optimizer='adam', lr=0.01), {})
++
++    assert len(param_groups) == 1
++    mock_all_gather.assert_not_called()
++
++
+ @patch('torch.distributed.get_world_size', return_value=1)
+ @patch(
+     'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+diff --git a/tests/unit_tests/test_parallel_state.py b/tests/unit_tests/test_parallel_state.py
+index 64c3a5b36a6e4363d5ec0041af715adf9aec8554..0ff52bdd34dcd85a1024410bd7ce498fd9c8a702 100644
+--- a/tests/unit_tests/test_parallel_state.py
++++ b/tests/unit_tests/test_parallel_state.py
+@@ -1,6 +1,7 @@
+ # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+ 
+ from math import log2
++from unittest.mock import patch
+ 
+ import pytest
+ import torch
+@@ -14,6 +15,34 @@ world_size = Utils.world_size
+ test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
+ 
+ 
++@pytest.mark.parametrize("crystal_mode", ["CAPTURE", "EMULATE"])
++@patch("torch.distributed.get_rank", return_value=7)
++@patch("torch.distributed.get_pg_count", return_value=42)
++@patch("torch.distributed.new_group", return_value=object())
++def test_create_group_uses_unique_description_for_crystal_replay(
++    mock_new_group, _mock_pg_count, _mock_rank, monkeypatch, crystal_mode
++):
++    monkeypatch.setenv("CRYSTAL_MODE", crystal_mode)
++
++    ps.create_group(ranks=[7], group_desc="DATA_PARALLEL_GROUP_WITH_CP")
++
++    assert mock_new_group.call_args.kwargs["group_desc"] == (
++        "DATA_PARALLEL_GROUP_WITH_CP-7-42-nccl"
++    )
++
++
++@patch("torch.distributed.get_rank", return_value=7)
++@patch("torch.distributed.new_group", return_value=object())
++def test_create_group_preserves_description_outside_crystal(
++    mock_new_group, _mock_rank, monkeypatch
++):
++    monkeypatch.delenv("CRYSTAL_MODE", raising=False)
++
++    ps.create_group(ranks=[7], group_desc="DATA_PARALLEL_GROUP_WITH_CP")
++
++    assert mock_new_group.call_args.kwargs["group_desc"] == "DATA_PARALLEL_GROUP_WITH_CP"
++
++
+ @pytest.mark.parametrize('order', test_parallel_order)
+ @pytest.mark.flaky
+ @pytest.mark.flaky_in_dev

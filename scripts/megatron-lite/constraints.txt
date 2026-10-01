@@ -1,0 +1,6 @@
+# Keep the NGC 25.06 PyTorch/NumPy ABI and the Lite dependency versions.
+torch==2.8.0a0+5228986c39.nv25.6
+numpy<2
+transformer-engine-cu12==2.14.0
+grpcio-tools==1.76.0
+protobuf==6.33.6

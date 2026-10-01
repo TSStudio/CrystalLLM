@@ -1,0 +1,1744 @@
+diff --git a/.gitignore b/.gitignore
+index 2a800f1..f8f2360 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -2,4 +2,11 @@
+ **/__pycache__
+ .vscode
+ *.DS_Store
+-.ipynb_checkpoints
+\ No newline at end of file
++.ipynb_checkpoints
++
++## Added by Crystal LLM project >>>
++.venv
++temp
++backup*
++logs*
++## <<< Added by Crystal LLM project
+\ No newline at end of file
+diff --git a/crystalllm/replay/tensor_providers.py b/crystalllm/replay/tensor_providers.py
+new file mode 100644
+index 0000000..eed990f
+--- /dev/null
++++ b/crystalllm/replay/tensor_providers.py
+@@ -0,0 +1,316 @@
++# Copyright (c) 2026 Aliyun Inc. All Rights Reserved.
++
++r"""Tensor Providers for CrystalLLM Replay Assistant."""
++
++from __future__ import annotations
++
++import logging
++import pathlib
++
++import torch
++from crystalllm.replay.data import (
++    ReplayerCommGroupInfo,
++    ReplayerCommOpInfo,
++    TensorMemoryLevel,
++    TensorProvider,
++)
++
++logger = logging.getLogger(__name__)
++
++# P2P activation tensor template configuration
++_P2P_TEMPLATE_DIR = pathlib.Path(__file__).parent
++_P2P_TEMPLATE_FILE = "p2p_activation_template.pt"
++_P2P_TEMPLATE_CACHE = None
++
++
++def _get_p2p_template() -> torch.Tensor | None:
++    """Load and cache the single P2P activation template.
++
++    Returns:
++        The cached template tensor, or None if not available.
++    """
++    global _P2P_TEMPLATE_CACHE
++    if _P2P_TEMPLATE_CACHE is None:
++        filepath = _P2P_TEMPLATE_DIR / _P2P_TEMPLATE_FILE
++        if pathlib.Path(filepath).exists():
++            _P2P_TEMPLATE_CACHE = torch.load(
++                filepath, map_location="cpu", weights_only=True
++            )
++            logger.info(
++                "Loaded P2P template: %s, shape=%s, std=%.4f",
++                _P2P_TEMPLATE_FILE,
++                _P2P_TEMPLATE_CACHE.shape,
++                _P2P_TEMPLATE_CACHE.float().std(),
++            )
++        else:
++            logger.warning("P2P template not found at %s", filepath)
++            _P2P_TEMPLATE_CACHE = False
++    return _P2P_TEMPLATE_CACHE if _P2P_TEMPLATE_CACHE is not False else None
++
++
++def _load_p2p_activation(required_shape: list[int], dtype: torch.dtype) -> torch.Tensor:
++    """Load P2P activation tensor from the single template file.
++
++    Uses simple shape transformation (tile/slice) to generate tensors
++    of any required shape from a single template.
++
++    P2P activation tensor shape format: [seq_length, micro_batch_size, hidden_size]
++        - dim 0: seq_length - Sequence length (may vary with sequence parallel)
++        - dim 1: micro_batch_size - Micro batch size
++        - dim 2: hidden_size - Hidden size (may vary with tensor parallel)
++
++    Args:
++        required_shape: Required tensor shape, e.g. [2048, 1, 5120] or [1024, 2, 5120]
++        dtype: Required tensor dtype
++
++    Returns:
++        Tensor with the specified shape and dtype
++    """
++    if len(required_shape) != 3:
++        return torch.randn(required_shape, dtype=dtype) * 7.0
++
++    template = _get_p2p_template()
++
++    if template is not None:
++        template_shape = list(template.shape)
++
++        if template_shape == required_shape:
++            return template.clone().to(dtype)
++
++        result = template.clone()
++
++        for dim in range(3):
++            t_size = template_shape[dim]
++            r_size = required_shape[dim]
++
++            if r_size != t_size:
++                if r_size > t_size:
++                    repeat_times = (r_size + t_size - 1) // t_size
++                    repeats = [1, 1, 1]
++                    repeats[dim] = repeat_times
++                    result = result.repeat(*repeats)
++                slices = [slice(None), slice(None), slice(None)]
++                slices[dim] = slice(r_size)
++                result = result[tuple(slices)]
++
++        assert list(result.shape) == required_shape, (
++            f"Shape mismatch after resize: {result.shape} != {required_shape}"
++        )
++        return result.to(dtype)
++
++    logger.warning("P2P activation template not available")
++    return torch.randn(required_shape, dtype=dtype) * 7.0
++
++
++def _is_p2p_forward_activation(
++    rank: int,
++    replay_op: ReplayerCommOpInfo,
++    comm_group: ReplayerCommGroupInfo,
++) -> bool:
++    """Determine if a P2P isend operation is sending forward activations.
++
++    For pipeline parallelism P2P communication:
++    - Forward pass: isend to next PP stage
++    - Backward pass: isend to previous PP stage
++
++    Args:
++        rank: The rank that owns this tensor demand.
++        replay_op: The communication operation info for the demand.
++        comm_group: The communication group the operation belongs to.
++
++    Returns:
++        True if this is a forward activation send, False if backward gradient.
++    """
++    group_ranks = comm_group.ranks
++    group_size = len(group_ranks)
++
++    my_group_rank = group_ranks.index(rank)
++
++    if "group_dst" in replay_op.meta:
++        group_dst = replay_op.meta["group_dst"]
++    elif "dst" in replay_op.meta:
++        dst_global_rank = replay_op.meta["dst"]
++        group_dst = group_ranks.index(dst_global_rank)
++    else:
++        raise ValueError(f"No destination info in op {replay_op}")
++
++    next_stage = (my_group_rank + 1) % group_size
++    return group_dst == next_stage
++
++
++class LogicalAndProvider(TensorProvider):
++    """Provider for logical_and_across_model_parallel_group operations.
++
++    Creates a tensor filled with ones for logical AND operations.
++    """
++
++    def can_handle(
++        self,
++        _rank: int,
++        replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++    ) -> bool:
++        return "logical_and_across_model_parallel_group" in replay_op.signature
++
++    def tensor_memory_level(
++        self,
++        _rank: int,
++        _replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++    ) -> TensorMemoryLevel:
++        return TensorMemoryLevel.PERSISTENT
++
++    def provide(
++        self,
++        _rank: int,
++        replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++        _use_index: int = -1,
++    ) -> torch.Tensor:
++        return torch.ones(replay_op.input_shape, dtype=replay_op.input_dtype)
++
++
++class P2PActivationOrGradientProvider(TensorProvider):
++    """Provider for P2P isend forward activations and backward gradients.
++
++    Forward activations use the captured template. Backward gradients use the
++    historical random distribution with std ~ 3.6e-8.
++    """
++
++    def can_handle(
++        self,
++        _rank: int,
++        replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++    ) -> bool:
++        return replay_op.c10d_func_name == "isend"
++
++    def tensor_memory_level(
++        self,
++        _rank: int,
++        _replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++    ) -> TensorMemoryLevel:
++        return TensorMemoryLevel.PERSISTENT
++
++    def provide(
++        self,
++        rank: int,
++        replay_op: ReplayerCommOpInfo,
++        comm_group: ReplayerCommGroupInfo,
++        _use_index: int = -1,
++    ) -> torch.Tensor:
++        if _is_p2p_forward_activation(rank, replay_op, comm_group):
++            return _load_p2p_activation(replay_op.input_shape, replay_op.input_dtype)
++        return torch.randn(replay_op.input_shape, dtype=replay_op.input_dtype) * 3.6e-8
++
++
++class GradSyncProvider(TensorProvider):
++    """Provider for gradient sync operations (start_grad_sync).
++
++    Gradient buffer for AllReduce/ReduceScatter before optimizer step.
++    Real gradients have std ~ 7.9e-6, range [-6.3e-4, 6.4e-4].
++    """
++
++    def can_handle(
++        self,
++        _rank: int,
++        replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++    ) -> bool:
++        return "start_grad_sync" in replay_op.signature
++
++    def tensor_memory_level(
++        self,
++        _rank: int,
++        _replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++    ) -> TensorMemoryLevel:
++        return TensorMemoryLevel.SHARED
++
++    def provide(
++        self,
++        _rank: int,
++        replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++        _use_index: int = -1,
++    ) -> torch.Tensor:
++        return torch.randn(replay_op.input_shape, dtype=replay_op.input_dtype) * 7.9e-6
++
++
++class ParamSyncProvider(TensorProvider):
++    """Provider for parameter sync operations (start_param_sync).
++
++    Parameter buffer for AllGather after optimizer step.
++    Real params have std ~ 0.012, mean ~ 0, range [-0.05, 1.0].
++    """
++
++    def can_handle(
++        self,
++        _rank: int,
++        replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++    ) -> bool:
++        return "start_param_sync" in replay_op.signature
++
++    def tensor_memory_level(
++        self,
++        _rank: int,
++        _replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++    ) -> TensorMemoryLevel:
++        return TensorMemoryLevel.SHARED
++
++    def provide(
++        self,
++        _rank: int,
++        replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++        _use_index: int = -1,
++    ) -> torch.Tensor:
++        return torch.randn(replay_op.input_shape, dtype=replay_op.input_dtype) * 0.012
++
++
++class GradStatsProvider(TensorProvider):
++    """Provider for scalar gradient statistics (get_grad_norm_fp32).
++
++    total_norm shoule not be a negative number and make total_norm ** 0.5 a complex.
++    Values are tiny positives ~ 1e-8.
++    """
++
++    def can_handle(
++        self,
++        _rank: int,
++        replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++    ) -> bool:
++        return "get_grad_norm_fp32" in replay_op.signature
++
++    def tensor_memory_level(
++        self,
++        _rank: int,
++        _replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++    ) -> TensorMemoryLevel:
++        return TensorMemoryLevel.SHARED
++
++    def provide(
++        self,
++        _rank: int,
++        replay_op: ReplayerCommOpInfo,
++        _comm_group: ReplayerCommGroupInfo,
++        _use_index: int = -1,
++    ) -> torch.Tensor:
++        return (
++            torch.randn(replay_op.input_shape, dtype=replay_op.input_dtype).abs_()
++            * 1e-8
++        )
++
++
++TENSOR_PROVIDERS: list[TensorProvider] = [
++    LogicalAndProvider(),
++    GradStatsProvider(),
++    P2PActivationOrGradientProvider(),
++    GradSyncProvider(),
++    ParamSyncProvider(),
++]
+diff --git a/examples/gpt3/pretrain_gpt_crystal.py b/examples/gpt3/pretrain_gpt_crystal.py
+new file mode 100644
+index 0000000..48d4de0
+--- /dev/null
++++ b/examples/gpt3/pretrain_gpt_crystal.py
+@@ -0,0 +1,381 @@
++# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
++
++"""Pretrain and SFT GPT."""
++
++import datetime
++import os
++import torch
++
++from functools import partial
++from typing import List, Optional, Tuple, Union
++from megatron.core import parallel_state
++from megatron.training import get_args
++from megatron.training import inprocess_restart
++from megatron.training import print_rank_0
++from megatron.training import get_timers
++from megatron.training import get_tokenizer
++from megatron.core import mpu
++from megatron.core.enums import ModelType
++from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
++from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
++from megatron.core.enums import ModelType
++from megatron.core.models.gpt import GPTModel
++from megatron.core.models.gpt.gpt_layer_specs import (
++    get_gpt_decoder_block_spec,
++    get_gpt_layer_local_spec,
++    get_gpt_layer_with_transformer_engine_spec,
++    get_gpt_mtp_block_spec,
++)
++from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
++    get_gpt_heterogeneous_layer_spec,
++)
++from megatron.core.rerun_state_machine import get_rerun_state_machine
++from megatron.core.transformer.spec_utils import import_module
++from megatron.core.utils import StragglerDetector
++from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
++from megatron.training.arguments import core_transformer_config_from_args
++from megatron.training.utils import (
++    get_batch_on_this_cp_rank,
++    get_batch_on_this_tp_rank,
++    get_blend_and_blend_per_split,
++)
++from megatron.training.yaml_arguments import core_transformer_config_from_yaml
++from megatron.training.datasets.sft_dataset import SFTDataset
++
++import megatron.legacy.model  # isort: skip
++
++# NOTE: Loading `megatron.legacy.model` earlier fails due to circular import
++
++try:
++    from megatron.post_training.arguments import add_modelopt_args, modelopt_args_enabled
++    from megatron.post_training.loss_func import loss_func as loss_func_modelopt
++    from megatron.post_training.model_provider import model_provider as model_provider_modelopt
++
++    has_nvidia_modelopt = True
++except ImportError:
++    has_nvidia_modelopt = False
++
++stimer = StragglerDetector()
++
++
++def model_provider(
++    pre_process=True, post_process=True, vp_stage: Optional[int] = None
++) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
++    """Builds the model.
++
++    If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
++
++    Args:
++        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
++        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
++
++
++    Returns:
++        Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
++    """
++    args = get_args()
++
++    if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
++        return model_provider_modelopt(pre_process, post_process)
++
++    use_te = args.transformer_impl == "transformer_engine"
++
++    if args.record_memory_history:
++        torch.cuda.memory._record_memory_history(
++            True,
++            # keep 100,000 alloc/free events from before the snapshot
++            trace_alloc_max_entries=100000,
++            # record stack information for the trace events
++            trace_alloc_record_context=True,
++        )
++
++        def oom_observer(device, alloc, device_alloc, device_free):
++            # snapshot right after an OOM happened
++            print('saving allocated state during OOM')
++            snapshot = torch.cuda.memory._snapshot()
++            from pickle import dump
++
++            dump(
++                snapshot,
++                open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", 'wb'),
++            )
++
++        torch._C._cuda_attach_out_of_memory_observer(oom_observer)
++
++    print_rank_0('building GPT model ...')
++    # Experimental loading arguments from yaml
++    if args.yaml_cfg is not None:
++        config = core_transformer_config_from_yaml(args, "language_model")
++    else:
++        config = core_transformer_config_from_args(args)
++
++    if args.use_legacy_models:
++        model = megatron.legacy.model.GPTModel(
++            config,
++            num_tokentypes=0,
++            parallel_output=True,
++            pre_process=pre_process,
++            post_process=post_process,
++        )
++    else:  # using core models
++        if args.spec is not None:
++            transformer_layer_spec = import_module(args.spec)
++        else:
++            if args.num_experts:
++                # Define the decoder block spec
++                transformer_layer_spec = get_gpt_decoder_block_spec(
++                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
++                )
++            elif args.heterogeneous_layers_config_path is not None:
++                transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
++            else:
++                # Define the decoder layer spec
++                if use_te:
++                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
++                        args.num_experts,
++                        args.moe_grouped_gemm,
++                        args.qk_layernorm,
++                        args.multi_latent_attention,
++                        args.moe_use_legacy_grouped_gemm,
++                        qk_l2_norm=args.qk_l2_norm,
++                        use_kitchen=config.use_kitchen,
++                    )
++                else:
++                    transformer_layer_spec = get_gpt_layer_local_spec(
++                        args.num_experts,
++                        args.moe_grouped_gemm,
++                        args.qk_layernorm,
++                        args.multi_latent_attention,
++                        args.moe_use_legacy_grouped_gemm,
++                        normalization=args.normalization,
++                        use_kitchen=config.use_kitchen,
++                    )
++        mtp_block_spec = None
++        if args.mtp_num_layers is not None:
++            mtp_block_spec = get_gpt_mtp_block_spec(
++                config, transformer_layer_spec, use_transformer_engine=use_te, vp_stage=vp_stage
++            )
++
++        model = GPTModel(
++            config=config,
++            transformer_layer_spec=transformer_layer_spec,
++            vocab_size=args.padded_vocab_size,
++            max_sequence_length=args.max_position_embeddings,
++            pre_process=pre_process,
++            post_process=post_process,
++            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
++            parallel_output=True,
++            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
++            position_embedding_type=args.position_embedding_type,
++            rotary_percent=args.rotary_percent,
++            rotary_base=args.rotary_base,
++            rope_scaling=args.use_rope_scaling,
++            mtp_block_spec=mtp_block_spec,
++            vp_stage=vp_stage,
++        )
++
++    return model
++
++
++def get_batch(data_iterator):
++    """Generate a batch."""
++
++    # TODO: this is pretty hacky, find a better way
++    if (not parallel_state.is_pipeline_first_stage(ignore_virtual=True)) and (
++        not parallel_state.is_pipeline_last_stage(ignore_virtual=True)
++    ):
++        return None, None, None, None, None
++
++    # get batches based on the TP rank you are on
++    batch = get_batch_on_this_tp_rank(data_iterator)
++
++    # slice batch along sequence dimension for context parallelism
++    batch = get_batch_on_this_cp_rank(batch)
++
++    return batch.values()
++
++
++# define spiky loss as a loss that's 10x the max loss observed
++SPIKY_LOSS_FACTOR = 10
++
++
++def loss_func(
++    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
++):
++    """Loss function.
++
++    Args:
++        loss_mask (torch.Tensor): Used to mask out some portions of the loss
++        output_tensor (torch.Tensor): The tensor with the losses
++        model (GPTModel, optional): The model (can be wrapped)
++
++    Returns:
++        the loss scalar for this micro-batch
++        the number of non-padded tokens in this microbatch
++        a dict containing reporting metrics on the loss and number of tokens across
++            the data parallel ranks
++    """
++    args = get_args()
++
++    if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
++        return loss_func_modelopt(loss_mask, output_tensor, model=model)
++
++    losses = output_tensor.view(-1).float()
++    loss_mask = loss_mask.view(-1).float()
++    loss = torch.sum(losses * loss_mask)
++
++    # Check individual rank losses are not NaN prior to DP all-reduce.
++    rerun_state_machine = get_rerun_state_machine()
++    if args.check_for_nan_in_loss_and_grad:
++        rerun_state_machine.validate_result(
++            result=loss,
++            rejection_func=torch.isnan,
++            message="found NaN in local forward loss calculation",
++            tolerance=0.0,  # forward pass calculations are determinisic
++            fatal=True,
++        )
++        rerun_state_machine.validate_result(
++            result=loss,
++            rejection_func=torch.isinf,
++            message="found Inf in local forward loss calculation",
++            tolerance=0.0,  # forward pass calculations are determinisic
++            fatal=True,
++        )
++    # Check for spiky loss
++    if args.check_for_spiky_loss:
++        rerun_state_machine.validate_result(
++            result=loss,
++            rejection_func=partial(
++                rerun_state_machine.is_unexpectedly_large,
++                threshold=SPIKY_LOSS_FACTOR,
++                context="loss",
++            ),
++            message="Spiky loss",
++            tolerance=0.0,  # forward pass calculations are determinisic
++            fatal=False,
++        )
++
++    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
++    reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
++
++    return (loss, num_tokens, {'lm loss': reporting_loss})
++
++
++from crystalllm.patch import crystal_patch_response
++
++
++@crystal_patch_response
++def forward_step(data_iterator, model: GPTModel):
++    """Forward training step.
++
++    Args:
++        data_iterator : Input data iterator
++        model (GPTModel): The GPT Model
++    """
++    args = get_args()
++    timers = get_timers()
++
++    # Get the batch.
++    timers('batch-generator', log_level=2).start()
++    global stimer
++    with stimer(bdata=True):
++        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
++    timers('batch-generator').stop()
++
++    if os.getenv("CRYSTAL_MODE") == "CAPTURE" and hasattr(model, "_crystal_temp"):
++        output_tensor = getattr(model, "_crystal_temp").clone().detach()
++    else:
++        with stimer:
++            if args.use_legacy_models:
++                output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
++            else:
++                output_tensor = model(
++                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
++                )
++        if os.getenv("CRYSTAL_MODE") == "CAPTURE":
++            setattr(model, "_crystal_temp", output_tensor.clone().detach())
++
++    # [ModelOpt]: model is needed to access ModelOpt distillation losses
++    return output_tensor, partial(loss_func, loss_mask, model=model)
++
++
++def is_dataset_built_on_rank():
++    return (
++        parallel_state.is_pipeline_first_stage(ignore_virtual=True)
++        or parallel_state.is_pipeline_last_stage(ignore_virtual=True)
++    ) and parallel_state.get_tensor_model_parallel_rank() == 0
++
++
++def core_gpt_dataset_config_from_args(args):
++    tokenizer = get_tokenizer()
++
++    # Sometimes --data-path is too long, instead we parse it from a file.
++    blend: Optional[Tuple[List[str], Optional[List[float]]]]
++    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
++    blend, blend_per_split = get_blend_and_blend_per_split(args)
++
++    return GPTDatasetConfig(
++        random_seed=args.seed,
++        sequence_length=args.seq_length,
++        blend=blend,
++        blend_per_split=blend_per_split,
++        split=args.split,
++        num_dataset_builder_threads=args.num_dataset_builder_threads,
++        path_to_cache=args.data_cache_path,
++        mmap_bin_files=args.mmap_bin_files,
++        tokenizer=tokenizer,
++        reset_position_ids=args.reset_position_ids,
++        reset_attention_mask=args.reset_attention_mask,
++        eod_mask_loss=args.eod_mask_loss,
++        create_attention_mask=args.create_attention_mask_in_dataloader,
++        object_storage_cache_path=args.object_storage_cache_path,
++        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
++    )
++
++
++def train_valid_test_datasets_provider(train_val_test_num_samples):
++    """Build the train test and validation datasets.
++
++    Args:
++        train_val_test_num_samples : A list containing the number of samples in train test and validation.
++    """
++    args = get_args()
++
++    config = core_gpt_dataset_config_from_args(args)
++
++    if args.sft:
++        dataset_type = SFTDataset
++    else:
++        if args.mock_data:
++            dataset_type = MockGPTDataset
++        else:
++            dataset_type = GPTDataset
++
++    print_rank_0("> building train, validation, and test datasets for GPT ...")
++
++    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
++        dataset_type, train_val_test_num_samples, is_dataset_built_on_rank, config
++    ).build()
++
++    print_rank_0("> finished creating GPT datasets ...")
++
++    return train_ds, valid_ds, test_ds
++
++
++if __name__ == "__main__":
++
++    # Temporary for transition to core datasets
++    train_valid_test_datasets_provider.is_distributed = True
++
++    # Optionally enable inprocess restart on pretrain
++    # pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
++
++    pretrain(
++        train_valid_test_datasets_provider,
++        model_provider,
++        ModelType.encoder_or_decoder,
++        forward_step,
++        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
++        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
++        store=None,
++    )
+diff --git a/examples/gpt3/run_pretrain_megatron_gpt3_crystal.sh b/examples/gpt3/run_pretrain_megatron_gpt3_crystal.sh
+new file mode 100755
+index 0000000..e943914
+--- /dev/null
++++ b/examples/gpt3/run_pretrain_megatron_gpt3_crystal.sh
+@@ -0,0 +1,241 @@
++#!/bin/bash
++set -e
++
++CURRENT_DIR="$( cd "$( dirname "$0" )" && pwd )"
++MEGATRON_PATCH_PATH=$( dirname $( dirname ${CURRENT_DIR}))
++export PATH=${MEGATRON_PATCH_PATH}/vendor:$PATH
++export PYTHONPATH=${MEGATRON_PATCH_PATH}:${MEGATRON_PATCH_PATH}/backends/megatron/Megatron-LM-250624:$PYTHONPATH
++if [ -n "${FORCE_CUDA_DEVICE_MAX_CONNECTIONS}" ]; then
++    export CUDA_DEVICE_MAX_CONNECTIONS=${FORCE_CUDA_DEVICE_MAX_CONNECTIONS}
++fi
++export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=true # for PyTorch >= 2.6
++
++RESOURCE_PATH=$MEGATRON_PATCH_PATH/resource/downloads/gpt3
++
++MODEL_SIZE=${1}
++shift 1
++CONFIG_ARGS="$@"
++
++NODE_LOG_DIR=${CRYSTAL_LOG_DIR}/node
++mkdir -p $NODE_LOG_DIR
++
++### BASE CONFIG ###
++LR=6.0e-5
++MIN_LR=6.0e-6
++
++### OTHERS ###
++# 是否使用Megatron版Zero-1降显存优化器
++DO=true
++# 是否优先使用Flash Attention
++FL=false
++# 激活检查点模式: sel, false
++AC=sel
++
++# In some case, Persistent Layer Normalization kernels from Transformer Engine
++# use spin-waiting for all SMs in the GPU, results in failure of communication
++# overlapping. NVTE_*_LAYERNORM_SM_MARGIN will reduce the SMs to wait in these
++# Transformer Engine kernels.
++# For reference:
++# https://github.com/NVIDIA/TransformerEngine/blob/v2.2/transformer_engine/common/normalization/rmsnorm/rmsnorm_fwd_cuda_kernel.cu#L97
++# https://github.com/NVIDIA/TransformerEngine/tree/v2.2/transformer_engine/common/normalization/rmsnorm/rmsnorm_bwd_semi_cuda_kernel.cu#L115
++# https://docs.nvidia.com/nemo-framework/user-guide/latest/performance/performance-guide.html#communication-overlaps-and-tuning
++export NVTE_FWD_LAYERNORM_SM_MARGIN=20
++export NVTE_BWD_LAYERNORM_SM_MARGIN=20
++export NVTE_NORM_FWD_USE_CUDNN=1
++export NVTE_NORM_BWD_USE_CUDNN=1
++export NVTE_EXT_MARGIN_SM=20
++
++# NCCL Profiler 参数
++# See nccl/ext-profiler/example/nccl/profiler.h
++# |-----------|-----|-----------|-----|
++# | NetPlugin | 128 | KernelCh  | 64  |
++# | ProxyCtrl | 32  | ProxyStep | 16  |
++# | ProxyOp   | 8   | P2p       | 4   |
++# | Coll      | 2   | Group     | 1   |
++# |-----------|-----|-----------|-----|
++if [ "$ENABLE_NCCL_PROFILER" = true ]; then
++    # NCCL Profiler
++    mkdir -p $CRYSTAL_LOG_DIR/profiler/nccl
++    # 通过 crystalllm_nccl_profiler python extension 查询 plugin 所在目录并装载
++    # See ext-profiler/example/python_ext/README.md
++    export LD_LIBRARY_PATH="$(python -m crystalllm_nccl_profiler lib-dir):${LD_LIBRARY_PATH}"
++fi
++
++export NCCL_PROFILE_EVENT_MASK=$((64+4+2+1))
++export NCCL_PROFILE_GROUP_POOL_SIZE=${CUSTOM_NCCL_PROFILER_POOL_SIZE:-2048}
++export NCCL_PROFILE_COLL_POOL_SIZE=${CUSTOM_NCCL_PROFILER_POOL_SIZE:-2048}
++export NCCL_PROFILE_P2P_POOL_SIZE=${CUSTOM_NCCL_PROFILER_POOL_SIZE:-2048}
++
++# torchrun 启动命令
++TORCHRUN="crystalllm-torchrun \
++    --master-addr $MASTER_ADDR \
++    --master-port $MASTER_PORT \
++    --nnodes $NNODES \
++    --node-rank $NODE_RANK \
++    --nproc-per-node $GPUS_PER_NODE"
++
++# Nsight System 启动命令
++NSYS_PROFILE="nsys profile \
++    -o ${CRYSTAL_LOG_DIR}/profiler/nsys/node_${NODE_RANK} \
++    --force-overwrite=true \
++    --capture-range=cudaProfilerApi \
++    --capture-range-end=stop \
++    --trace=cuda,nvtx \
++    --cuda-event-trace=false \
++    --sample none"
++
++# 启动命令
++STARTUP_COMMAND="${TORCHRUN} --no-python crystalllm-numarun python -u"
++
++# Crystal Timer
++if [ "$ENABLE_CRYSTAL_TIMER" = true ]; then
++    mkdir -p $CRYSTAL_LOG_DIR/timer
++fi
++
++# Crystal Monitor
++if [ "$ENABLE_CRYSTAL_MONITOR" = true ]; then
++    mkdir -p $CRYSTAL_LOG_DIR/monitor
++fi
++
++# debug_options
++debug_options=" \
++    --no-check-for-nan-in-loss-and-grad \
++    --distributed-timeout-minutes 30"
++
++# env_options
++# These options MUST be passed by environment variables
++env_options=" \
++    --train-iters ${CRYSTAL_TRAIN_ITERS} \
++    --profile-step-start ${CRYSTAL_ANALYSIS_STEP_START} \
++    --profile-step-end ${CRYSTAL_ANALYSIS_STEP_END}"
++
++# profiler_options
++if [ "$USE_NSIGHT_SYSTEM" = true ]; then
++    # Nsight System
++    mkdir -p $CRYSTAL_LOG_DIR/profiler/nsys
++
++    STARTUP_COMMAND="${NSYS_PROFILE} ${STARTUP_COMMAND}"
++    profiler_options=" \
++        --profile"
++elif [ "$USE_PYTORCH_PROFILER" = true ]; then
++    # PyTorch Profiler
++    mkdir -p $CRYSTAL_LOG_DIR/profiler/pytorch
++
++    profiler_options=" \
++        --profile \
++        --use-pytorch-profiler"
++else
++    profiler_options=" \
++        "
++fi
++
++# tensorboard_options
++if [ "$ENABLE_TENSORBOARD" = true ]; then
++    TENSORBOARD_DIR=${CRYSTAL_LOG_DIR}/tensorboard
++    mkdir -p $TENSORBOARD_DIR
++    tensorboard_options=" \
++        --tensorboard-dir ${TENSORBOARD_DIR} \
++        --tensorboard-queue-size 1 \
++        --log-timers-to-tensorboard"
++else
++    tensorboard_options=" \
++    "
++fi
++
++# attn_backend_option
++if [ $FL = true ]; then
++    export NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=0
++    attn_backend_option=" \
++        --attention-backend flash"
++elif [ $FL = false ]; then
++    export NVTE_FLASH_ATTN=0 NVTE_FUSED_ATTN=1
++    attn_backend_option=" \
++        --attention-backend fused"
++fi
++
++# gpt_options
++if [ $MODEL_SIZE = 20B ]; then
++    gpt_options=" \
++        --num-layers 64 \
++        --hidden-size 5120 \
++        --num-attention-heads 40 \
++        --seq-length 2048 \
++        --max-position-embeddings 2048"
++elif [ $MODEL_SIZE = 175B ]; then
++    gpt_options=" \
++        --num-layers 96 \
++        --hidden-size 12288 \
++        --num-attention-heads 96 \
++        --seq-length 2048 \
++        --max-position-embeddings 2048"
++fi
++
++# activation_checkpoint_options
++if [ $AC = sel ]; then
++    activation_checkpoint_options=" \
++        --recompute-activations"
++else
++    activation_checkpoint_options=" \
++    "
++fi
++
++# do_option
++if [ $DO = true ]; then
++    do_option=" \
++        --use-distributed-optimizer"
++elif [ $DO = false ]; then
++    do_option=" \
++    "
++fi
++
++# load_options
++load_options=" \
++    --vocab-file $RESOURCE_PATH/tokenizer/gpt2-vocab.json \
++    --merge-file $RESOURCE_PATH/tokenizer/gpt2-merges.txt"
++
++# dataset_options
++dataset_options=" \
++    --mock-data \
++    --split 1,1,0"
++
++# megatron_options
++megatron_options=" \
++    --manual-gc \
++    --manual-gc-interval 100 \
++    --bf16 \
++    --lr ${LR} \
++    --min-lr ${MIN_LR} \
++    --lr-decay-style cosine \
++    --weight-decay 0.1 \
++    --adam-beta1 0.9 \
++    --adam-beta2 0.95 \
++    --init-method-std 0.006 \
++    --clip-grad 1.0 \
++    --lr-warmup-fraction .001 \
++    --lr-decay-iters 430000 \
++    --log-interval 1 \
++    --log-throughput \
++    --eval-iters 0 \
++    --ckpt-format torch_dist \
++    --disable-gloo-process-groups \
++    --transformer-impl transformer_engine \
++    --seed 1234"
++
++run_cmd="${STARTUP_COMMAND} pretrain_gpt_crystal.py \
++${megatron_options} \
++${dataset_options} \
++${load_options} \
++${do_option} \
++${activation_checkpoint_options} \
++${gpt_options} \
++${attn_backend_option} \
++${tensorboard_options} \
++${profiler_options} \
++${env_options} \
++${debug_options} \
++${CONFIG_ARGS}
++"
++
++cd $CURRENT_DIR
++echo ${run_cmd}
++eval ${run_cmd}
+diff --git a/examples/qwen3/pretrain_qwen_crystal.py b/examples/qwen3/pretrain_qwen_crystal.py
+new file mode 100644
+index 0000000..d6278c6
+--- /dev/null
++++ b/examples/qwen3/pretrain_qwen_crystal.py
+@@ -0,0 +1,146 @@
++# Copyright (c) 2025 Alibaba PAI and Nvidia Megatron-LM Team.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from typing import Optional, Union
++from contextlib import nullcontext
++import torch
++import torch._dynamo
++import inspect
++
++from megatron.core.enums import ModelType
++from megatron.core.models.gpt import GPTModel
++from megatron.core.models.gpt.gpt_layer_specs import (
++    get_gpt_decoder_block_spec,
++    get_gpt_layer_local_spec,
++    get_gpt_layer_with_transformer_engine_spec,
++    get_gpt_mtp_block_spec,
++)
++from megatron.core.transformer.spec_utils import import_module
++from megatron.training.arguments import core_transformer_config_from_args
++from megatron.training.yaml_arguments import core_transformer_config_from_yaml
++from megatron_patch.arguments import get_patch_args
++from megatron_patch.data import train_valid_test_datasets_provider
++from megatron.training import get_args, pretrain, print_rank_0
++
++torch._dynamo.config.suppress_errors = True
++
++
++def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] = None) -> Union[GPTModel]:
++    """Builds the model.
++
++    If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
++
++    Args:
++        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
++        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
++
++
++    Returns:
++        Union[GPTModel]: The returned model
++    """
++    args = get_args()
++    use_te = args.transformer_impl == "transformer_engine"
++
++    if args.record_memory_history:
++        torch.cuda.memory._record_memory_history(True,
++            # keep 100,000 alloc/free events from before the snapshot
++            trace_alloc_max_entries=100000,
++
++            # record stack information for the trace events
++            trace_alloc_record_context=True)
++
++        def oom_observer(device, alloc, device_alloc, device_free):
++            # snapshot right after an OOM happened
++            print('saving allocated state during OOM')
++            snapshot = torch.cuda.memory._snapshot()
++            from pickle import dump
++            dump(snapshot, open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", 'wb'))
++
++        torch._C._cuda_attach_out_of_memory_observer(oom_observer)
++
++    print_rank_0('building QWen3 model ...')
++    # Experimental loading arguments from yaml
++    if args.yaml_cfg is not None:
++        config = core_transformer_config_from_yaml(args, "language_model")
++    else:
++        config = core_transformer_config_from_args(args)
++
++    if args.spec is not None:
++        transformer_layer_spec = import_module(args.spec)
++    else:
++        if args.num_experts:
++            # Define the decoder block spec
++            transformer_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=use_te, normalization=args.normalization, vp_stage=vp_stage)
++        else:
++            # Define the decoder layer spec
++            if use_te:
++                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
++                    args.num_experts, args.moe_grouped_gemm,
++                    args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm)
++            else:
++                transformer_layer_spec = get_gpt_layer_local_spec(
++                    args.num_experts, args.moe_grouped_gemm,
++                    args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm,
++                    normalization=args.normalization)
++    mtp_block_spec = None
++    if args.mtp_num_layers is not None:
++        mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, use_transformer_engine=use_te)
++
++    build_model_context = nullcontext
++    build_model_context_args = {}
++    if args.fp8_param_gather:
++        try:
++            from transformer_engine.pytorch import fp8_model_init
++
++            build_model_context = fp8_model_init
++            build_model_context_args["enabled"] = True
++
++            # Check if fp8_model_init supports preserve_high_precision_init_val
++            if "preserve_high_precision_init_val" in inspect.signature(fp8_model_init).parameters:
++                build_model_context_args["preserve_high_precision_init_val"] = True
++        except:
++            raise RuntimeError("--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found.")
++
++    with build_model_context(**build_model_context_args):
++        model = GPTModel(
++            config=config,
++            transformer_layer_spec=transformer_layer_spec,
++            vocab_size=args.padded_vocab_size,
++            max_sequence_length=args.max_position_embeddings,
++            pre_process=pre_process,
++            post_process=post_process,
++            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
++            parallel_output=True,
++            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
++            position_embedding_type=args.position_embedding_type,
++            rotary_percent=args.rotary_percent,
++            rotary_base=args.rotary_base,
++            rope_scaling=args.use_rope_scaling,
++            mtp_block_spec=mtp_block_spec,
++            vp_stage=vp_stage,
++        )
++
++    return model
++
++if __name__ == "__main__":
++    from megatron_patch.template.helper import forward_step
++    train_valid_test_datasets_provider.is_distributed = True
++
++    pretrain(
++        train_valid_test_datasets_provider,
++        model_provider,
++        ModelType.encoder_or_decoder,
++        forward_step,
++        extra_args_provider=get_patch_args,
++    )
+\ No newline at end of file
+diff --git a/examples/qwen3/run_mcore_qwen3_crystal.sh b/examples/qwen3/run_mcore_qwen3_crystal.sh
+new file mode 100644
+index 0000000..217b1b4
+--- /dev/null
++++ b/examples/qwen3/run_mcore_qwen3_crystal.sh
+@@ -0,0 +1,499 @@
++#!/bin/bash
++set -e
++
++CURRENT_DIR="$( cd "$( dirname "$0" )" && pwd )"
++MEGATRON_PATCH_PATH=$( dirname $( dirname ${CURRENT_DIR}))
++export PATH=${MEGATRON_PATCH_PATH}/vendor:$PATH
++export PYTHONPATH=${MEGATRON_PATCH_PATH}:${MEGATRON_PATCH_PATH}/backends/megatron/Megatron-LM-250624:$PYTHONPATH
++if [ -n "${FORCE_CUDA_DEVICE_MAX_CONNECTIONS}" ]; then
++    export CUDA_DEVICE_MAX_CONNECTIONS=${FORCE_CUDA_DEVICE_MAX_CONNECTIONS}
++fi
++export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=true # for PyTorch >= 2.6
++
++RESOURCE_PATH=$MEGATRON_PATCH_PATH/resource/downloads/qwen3
++
++MODEL_SIZE=${1}
++shift 1
++CONFIG_ARGS="$@"
++
++NODE_LOG_DIR=${CRYSTAL_LOG_DIR}/node
++mkdir -p $NODE_LOG_DIR
++
++### BASE CONFIG ###
++LR=1e-5
++MIN_LR=1e-6
++SEQ_LEN=4096
++PAD_LEN=4096
++# 训练精度: fp16, bf16, fp8
++PR=bf16
++
++### PARALLEL ###
++# 上下文并行度
++CP=1
++
++### OTHERS ###
++# 是否使用Megatron版Zero-1降显存优化器
++DO=true
++# 是否优先使用Flash Attention
++FL=true
++# 激活检查点模式: sel, false
++AC=sel
++# 学习率调度器
++LR_WARMUP_ITERS=1
++LR_DECAY_ITERS=1000
++
++# In some case, Persistent Layer Normalization kernels from Transformer Engine
++# use spin-waiting for all SMs in the GPU, results in failure of communication
++# overlapping. NVTE_*_LAYERNORM_SM_MARGIN will reduce the SMs to wait in these
++# Transformer Engine kernels.
++# For reference:
++# https://github.com/NVIDIA/TransformerEngine/blob/v2.2/transformer_engine/common/normalization/rmsnorm/rmsnorm_fwd_cuda_kernel.cu#L97
++# https://github.com/NVIDIA/TransformerEngine/tree/v2.2/transformer_engine/common/normalization/rmsnorm/rmsnorm_bwd_semi_cuda_kernel.cu#L115
++# https://docs.nvidia.com/nemo-framework/user-guide/latest/performance/performance-guide.html#communication-overlaps-and-tuning
++export NVTE_FWD_LAYERNORM_SM_MARGIN=20
++export NVTE_BWD_LAYERNORM_SM_MARGIN=20
++export NVTE_NORM_FWD_USE_CUDNN=1
++export NVTE_NORM_BWD_USE_CUDNN=1
++export NVTE_EXT_MARGIN_SM=20
++
++# NCCL Profiler 参数
++# See nccl/ext-profiler/example/nccl/profiler.h
++# |-----------|-----|-----------|-----|
++# | NetPlugin | 128 | KernelCh  | 64  |
++# | ProxyCtrl | 32  | ProxyStep | 16  |
++# | ProxyOp   | 8   | P2p       | 4   |
++# | Coll      | 2   | Group     | 1   |
++# |-----------|-----|-----------|-----|
++if [ "$ENABLE_NCCL_PROFILER" = true ]; then
++    # NCCL Profiler
++    mkdir -p $CRYSTAL_LOG_DIR/profiler/nccl
++    # 通过 crystalllm_nccl_profiler python extension 查询 plugin 所在目录并装载
++    # See ext-profiler/example/python_ext/README.md
++    export LD_LIBRARY_PATH="$(python -m crystalllm_nccl_profiler lib-dir):${LD_LIBRARY_PATH}"
++fi
++
++export NCCL_PROFILE_EVENT_MASK=$((64+4+2+1))
++export NCCL_PROFILE_GROUP_POOL_SIZE=${CUSTOM_NCCL_PROFILER_POOL_SIZE:-2048}
++export NCCL_PROFILE_COLL_POOL_SIZE=${CUSTOM_NCCL_PROFILER_POOL_SIZE:-2048}
++export NCCL_PROFILE_P2P_POOL_SIZE=${CUSTOM_NCCL_PROFILER_POOL_SIZE:-2048}
++
++# torchrun 启动命令
++TORCHRUN="crystalllm-torchrun \
++    --master-addr $MASTER_ADDR \
++    --master-port $MASTER_PORT \
++    --nnodes $NNODES \
++    --node-rank $NODE_RANK \
++    --nproc-per-node $GPUS_PER_NODE"
++
++# Nsight System 启动命令
++NSYS_PROFILE="nsys profile \
++    -o ${CRYSTAL_LOG_DIR}/profiler/nsys/node_${NODE_RANK} \
++    --force-overwrite=true \
++    --capture-range=cudaProfilerApi \
++    --capture-range-end=stop \
++    --trace=cuda,nvtx \
++    --cuda-event-trace=false \
++    --sample none"
++
++# 启动命令
++STARTUP_COMMAND="${TORCHRUN} --no-python crystalllm-numarun python -u"
++
++# Crystal Timer
++if [ "$ENABLE_CRYSTAL_TIMER" = true ]; then
++    mkdir -p $CRYSTAL_LOG_DIR/timer
++fi
++
++# Crystal Monitor
++if [ "$ENABLE_CRYSTAL_MONITOR" = true ]; then
++    mkdir -p $CRYSTAL_LOG_DIR/monitor
++fi
++
++# debug_options
++debug_options=" \
++    --no-check-for-nan-in-loss-and-grad \
++    --distributed-timeout-minutes 30"
++
++# env_options
++# These options MUST be passed by environment variables
++env_options=" \
++    --train-iters ${CRYSTAL_TRAIN_ITERS} \
++    --profile-step-start ${CRYSTAL_ANALYSIS_STEP_START} \
++    --profile-step-end ${CRYSTAL_ANALYSIS_STEP_END}"
++
++# profiler_options
++if [ "$USE_NSIGHT_SYSTEM" = true ]; then
++    # Nsight System
++    mkdir -p $CRYSTAL_LOG_DIR/profiler/nsys
++
++    STARTUP_COMMAND="${NSYS_PROFILE} ${STARTUP_COMMAND}"
++    profiler_options=" \
++        --profile"
++elif [ "$USE_PYTORCH_PROFILER" = true ]; then
++    # PyTorch Profiler
++    mkdir -p $CRYSTAL_LOG_DIR/profiler/pytorch
++
++    profiler_options=" \
++        --profile \
++        --use-pytorch-profiler"
++else
++    profiler_options=" \
++        "
++fi
++
++# tensorboard_options
++if [ "$ENABLE_TENSORBOARD" = true ]; then
++    TENSORBOARD_DIR=${CRYSTAL_LOG_DIR}/tensorboard
++    mkdir -p $TENSORBOARD_DIR
++    tensorboard_options=" \
++        --tensorboard-dir ${TENSORBOARD_DIR} \
++        --tensorboard-queue-size 1 \
++        --log-timers-to-tensorboard"
++else
++    tensorboard_options=" \
++    "
++fi
++
++# attn_backend_option
++if [ $FL = true ]; then
++    export NVTE_FLASH_ATTN=1 NVTE_FUSED_ATTN=0
++    attn_backend_option=" \
++        --attention-backend flash"
++elif [ $FL = false ]; then
++    export NVTE_FLASH_ATTN=0 NVTE_FUSED_ATTN=1
++    attn_backend_option=" \
++        --attention-backend fused"
++fi
++
++# gqa_options / tie_option / moe_options
++if [ $MODEL_SIZE = 0.6B ]; then
++    NUM_LAYERS=28
++    HIDDEN_SIZE=1024
++    NUM_ATTENTION_HEADS=16
++    INTERMEDIATE_SIZE=3072
++    NUM_KEY_VALUE_HEADS=8
++    MAX_POSITION_EMBEDDINGS=40960
++    VOCAB_SIZE=151936
++    ROPE_THETA=1000000
++    RMS_NORM_EPS=1e-6
++
++    gqa_options=" \
++        --group-query-attention \
++        --num-query-groups ${NUM_KEY_VALUE_HEADS}"
++    tie_option=""
++    moe_options=""
++elif [ $MODEL_SIZE = 1.7B ]; then
++    NUM_LAYERS=28
++    HIDDEN_SIZE=2048
++    NUM_ATTENTION_HEADS=16
++    INTERMEDIATE_SIZE=6144
++    NUM_KEY_VALUE_HEADS=8
++    MAX_POSITION_EMBEDDINGS=40960
++    VOCAB_SIZE=151936
++    ROPE_THETA=1000000
++    RMS_NORM_EPS=1e-6
++
++    gqa_options=" \
++        --group-query-attention \
++        --num-query-groups ${NUM_KEY_VALUE_HEADS}"
++    tie_option=""
++    moe_options=""
++elif [ $MODEL_SIZE = 4B ]; then
++    NUM_LAYERS=36
++    HIDDEN_SIZE=2560
++    NUM_ATTENTION_HEADS=32
++    INTERMEDIATE_SIZE=9728
++    NUM_KEY_VALUE_HEADS=8
++    MAX_POSITION_EMBEDDINGS=40960
++    VOCAB_SIZE=151936
++    ROPE_THETA=1000000
++    RMS_NORM_EPS=1e-6
++
++    gqa_options=" \
++         --group-query-attention \
++         --num-query-groups ${NUM_KEY_VALUE_HEADS}"
++    tie_option=""
++    moe_options=""
++elif [ $MODEL_SIZE = 8B ]; then
++    NUM_LAYERS=36
++    HIDDEN_SIZE=4096
++    NUM_ATTENTION_HEADS=32
++    INTERMEDIATE_SIZE=12288
++    NUM_KEY_VALUE_HEADS=8
++    MAX_POSITION_EMBEDDINGS=40960
++    VOCAB_SIZE=151936
++    ROPE_THETA=1000000
++    RMS_NORM_EPS=1e-6
++
++    gqa_options=" \
++        --group-query-attention \
++        --num-query-groups ${NUM_KEY_VALUE_HEADS}"
++    tie_option=" \
++        --untie-embeddings-and-output-weights"
++    moe_options=""
++elif [ $MODEL_SIZE = 14B ]; then
++    NUM_LAYERS=40
++    HIDDEN_SIZE=5120
++    NUM_ATTENTION_HEADS=40
++    INTERMEDIATE_SIZE=17408
++    NUM_KEY_VALUE_HEADS=8
++    MAX_POSITION_EMBEDDINGS=40960
++    VOCAB_SIZE=151936
++    ROPE_THETA=1000000
++    RMS_NORM_EPS=1e-6
++
++    gqa_options=" \
++        --group-query-attention \
++        --num-query-groups ${NUM_KEY_VALUE_HEADS}"
++    tie_option=" \
++        --untie-embeddings-and-output-weights"
++    moe_options=""
++elif [ $MODEL_SIZE = 32B ]; then
++    NUM_LAYERS=64
++    HIDDEN_SIZE=5120
++    NUM_ATTENTION_HEADS=64
++    INTERMEDIATE_SIZE=25600
++    NUM_KEY_VALUE_HEADS=8
++    MAX_POSITION_EMBEDDINGS=40960
++    VOCAB_SIZE=151936
++    ROPE_THETA=1000000
++    RMS_NORM_EPS=1e-6
++
++    gqa_options=" \
++        --group-query-attention \
++        --num-query-groups ${NUM_KEY_VALUE_HEADS}"
++    tie_option=" \
++        --untie-embeddings-and-output-weights"
++    moe_options=""
++elif [ $MODEL_SIZE = A3B ]; then
++    HIDDEN_SIZE=2048
++    NUM_ATTENTION_HEADS=32
++    NUM_LAYERS=48
++    INTERMEDIATE_SIZE=6144
++    MOE_INTERMEDIATE_SIZE=768
++    MAX_POSITION_EMBEDDINGS=40960
++    VOCAB_SIZE=151936
++    NUM_KEY_VALUE_HEADS=4
++    ROPE_THETA=1000000
++    NUM_EXPERTS=128
++    ROUTER_TOPK=8
++    RMS_NORM_EPS=1e-6
++
++    moe_options=" \
++        --moe-grouped-gemm \
++        --moe-token-dispatcher-type alltoall \
++        --moe-router-topk ${ROUTER_TOPK} \
++        --num-experts ${NUM_EXPERTS} \
++        --moe-ffn-hidden-size ${MOE_INTERMEDIATE_SIZE} \
++        --moe-router-load-balancing-type aux_loss \
++        --moe-aux-loss-coeff 0.001 \
++        --moe-layer-freq '([1]*48)'"
++    tie_option=" \
++        --untie-embeddings-and-output-weights"
++    gqa_options=" \
++        --group-query-attention \
++        --num-query-groups ${NUM_KEY_VALUE_HEADS}"
++elif [ $MODEL_SIZE = A22B ]; then
++    HIDDEN_SIZE=4096
++    NUM_ATTENTION_HEADS=64
++    NUM_LAYERS=94
++    INTERMEDIATE_SIZE=12288
++    MOE_INTERMEDIATE_SIZE=1536
++    MAX_POSITION_EMBEDDINGS=40960
++    VOCAB_SIZE=151936
++    NUM_KEY_VALUE_HEADS=4
++    ROPE_THETA=1000000
++    NUM_EXPERTS=128
++    ROUTER_TOPK=8
++    RMS_NORM_EPS=1e-6
++
++    moe_options=" \
++        --moe-grouped-gemm \
++        --moe-token-dispatcher-type alltoall \
++        --moe-router-topk ${ROUTER_TOPK} \
++        --num-experts ${NUM_EXPERTS} \
++        --moe-ffn-hidden-size ${MOE_INTERMEDIATE_SIZE} \
++        --moe-router-load-balancing-type aux_loss \
++        --moe-aux-loss-coeff 0.001 \
++        --moe-layer-freq '([1]*94)'"
++    tie_option=" \
++        --untie-embeddings-and-output-weights"
++    gqa_options=" \
++        --group-query-attention \
++        --num-query-groups ${NUM_KEY_VALUE_HEADS}"
++elif [ $MODEL_SIZE = A20B ]; then
++    HIDDEN_SIZE=4096
++    NUM_ATTENTION_HEADS=32
++    NUM_LAYERS=62
++    INTERMEDIATE_SIZE=12288
++    MOE_INTERMEDIATE_SIZE=2560
++    MAX_POSITION_EMBEDDINGS=40960
++    VOCAB_SIZE=151936
++    NUM_KEY_VALUE_HEADS=8
++    ROPE_THETA=1000000
++    NUM_EXPERTS=256
++    ROUTER_TOPK=8
++    RMS_NORM_EPS=1e-6
++
++    moe_options=" \
++        --moe-grouped-gemm \
++        --moe-token-dispatcher-type alltoall \
++        --moe-router-topk ${ROUTER_TOPK} \
++        --num-experts ${NUM_EXPERTS} \
++        --moe-ffn-hidden-size ${MOE_INTERMEDIATE_SIZE} \
++        --moe-router-load-balancing-type aux_loss \
++        --moe-aux-loss-coeff 0.001 \
++        --moe-layer-freq '([1]*62)'"
++    tie_option=" \
++        --untie-embeddings-and-output-weights"
++    gqa_options=" \
++        --group-query-attention \
++        --num-query-groups ${NUM_KEY_VALUE_HEADS}"
++elif [ $MODEL_SIZE = A43B ]; then
++    HIDDEN_SIZE=8192
++    NUM_ATTENTION_HEADS=64
++    NUM_LAYERS=62
++    INTERMEDIATE_SIZE=12288
++    MOE_INTERMEDIATE_SIZE=2560
++    MAX_POSITION_EMBEDDINGS=40960
++    VOCAB_SIZE=151936
++    NUM_KEY_VALUE_HEADS=8
++    ROPE_THETA=1000000
++    NUM_EXPERTS=256
++    ROUTER_TOPK=8
++    RMS_NORM_EPS=1e-6
++
++    moe_options=" \
++        --moe-grouped-gemm \
++        --moe-token-dispatcher-type alltoall \
++        --moe-router-topk ${ROUTER_TOPK} \
++        --num-experts ${NUM_EXPERTS} \
++        --moe-ffn-hidden-size ${MOE_INTERMEDIATE_SIZE} \
++        --moe-router-load-balancing-type aux_loss \
++        --moe-aux-loss-coeff 0.001 \
++        --moe-layer-freq '([1]*62)'"
++    tie_option=" \
++        --untie-embeddings-and-output-weights"
++    gqa_options=" \
++        --group-query-attention \
++        --num-query-groups ${NUM_KEY_VALUE_HEADS}"
++fi
++
++# activation_checkpoint_options
++if [ $AC = sel ]; then
++    activation_checkpoint_options=" \
++        --recompute-activations"
++else
++    activation_checkpoint_options=" \
++    "
++fi
++
++# pr_options
++if [ $PR = fp16 ]; then
++    pr_options=" \
++        --fp16 \
++        --apply-query-key-layer-scaling"
++    export NVTE_APPLY_QK_LAYER_SCALING=1
++elif [ $PR = bf16 ]; then
++    pr_options=" \
++        --bf16"
++elif [ $PR = fp8 ]; then
++    pr_options=" \
++        --bf16 \
++        --fp8-format hybrid \
++        --fp8-recipe blockwise"
++fi
++
++# do_option
++if [ $DO = true ]; then
++    do_option=" \
++        --use-distributed-optimizer"
++elif [ $DO = false ]; then
++    do_option=" \
++    "
++fi
++
++# load_options
++# [Crystal Patch]
++# Use vocab.json, merges.txt and tokenizer files from pretrained checkpoint
++# instead of loading all checkpoint (CPT tasks)
++load_options=" \
++    --vocab-file $RESOURCE_PATH/tokenizer/vocab.json \
++    --merge-file $RESOURCE_PATH/tokenizer/merges.txt \
++    --patch-tokenizer-path $RESOURCE_PATH/tokenizer"
++
++# dataset_options
++dataset_options=" \
++    --data-path $RESOURCE_PATH/dataset/mmap_qwen3_datasets_text_document \
++    --split 99,1,0 \
++    --dataset MMAP"
++
++# megatron_options
++megatron_options=" \
++    --train-mode pretrain \
++    --manual-gc \
++    --manual-gc-interval 100 \
++    --lr ${LR} \
++    --min-lr ${MIN_LR} \
++    --lr-decay-style cosine \
++    --weight-decay 0.01 \
++    --adam-beta1 0.9 \
++    --adam-beta2 0.95 \
++    --clip-grad 1.0 \
++    --init-method-std 0.008 \
++    --attention-dropout 0.0 \
++    --hidden-dropout 0.0 \
++    --lr-decay-iters ${LR_DECAY_ITERS} \
++    --lr-warmup-iters ${LR_WARMUP_ITERS} \
++    --num-layers ${NUM_LAYERS} \
++    --hidden-size ${HIDDEN_SIZE} \
++    --num-attention-heads ${NUM_ATTENTION_HEADS} \
++    --ffn-hidden-size ${INTERMEDIATE_SIZE} \
++    --seq-length ${SEQ_LEN} \
++    --max-position-embeddings ${MAX_POSITION_EMBEDDINGS} \
++    --max-padding-length ${PAD_LEN} \
++    --log-interval 1 \
++    --log-throughput \
++    --eval-iters 0 \
++    --context-parallel-size ${CP} \
++    --no-load-optim \
++    --no-load-rng \
++    --num-workers 32 \
++    --padded-vocab-size ${VOCAB_SIZE} \
++    --patch-tokenizer-type Qwen3Tokenizer \
++    --swiglu \
++    --normalization RMSNorm \
++    --norm-epsilon ${RMS_NORM_EPS} \
++    --use-rotary-position-embeddings \
++    --position-embedding-type rope \
++    --disable-bias-linear \
++    --rotary-base ${ROPE_THETA} \
++    --no-save-optim \
++    --ckpt-format torch_dist \
++    --disable-gloo-process-groups \
++    --transformer-impl transformer_engine \
++    --cross-entropy-loss-fusion \
++    --qk-layernorm \
++    --kv-channels 128 \
++    --seed 1234"
++
++run_cmd="${STARTUP_COMMAND} pretrain_qwen_crystal.py \
++${megatron_options} \
++${dataset_options} \
++${load_options} \
++${do_option} \
++${pr_options} \
++${activation_checkpoint_options} \
++${moe_options} \
++${tie_option} \
++${gqa_options} \
++${attn_backend_option} \
++${tensorboard_options} \
++${profiler_options} \
++${env_options} \
++${debug_options} \
++${CONFIG_ARGS}
++"
++
++cd $CURRENT_DIR
++echo ${run_cmd}
++eval ${run_cmd}
+diff --git a/megatron_patch/arguments.py b/megatron_patch/arguments.py
+index 87b4685..daa62b4 100644
+--- a/megatron_patch/arguments.py
++++ b/megatron_patch/arguments.py
+@@ -155,6 +155,12 @@ def get_patch_args(parser):
+ 
+     group.add_argument("--patch-tokenizer-type", type=str, help="patch-tokenizer-type")
+ 
++    # [Crystal Patch]
++    # The __init__() of _Qwen3Tokenizer uses AutoTokenizer.from_pretrained() in transformers,
++    # which need a path to specifiy the tokenizer files. Original patch is designed for CPT tasks
++    # and uses --load directory default. For pretrain from scratch tasks, we will not use --load.
++    group.add_argument("--patch-tokenizer-path", type=str, help="patch-tokenizer-path")
++
+     group.add_argument(
+         "--use-alibi-mask",
+         action="store_true",
+diff --git a/megatron_patch/template/helper.py b/megatron_patch/template/helper.py
+index c135fe6..784dda9 100644
+--- a/megatron_patch/template/helper.py
++++ b/megatron_patch/template/helper.py
+@@ -166,6 +166,9 @@ def loss_func(loss_mask: torch.Tensor, num_seqs: torch.Tensor, output_tensor: to
+         return loss[0] / loss[1] * args.context_parallel_size, {"lm loss": averaged_loss}
+     return loss[0] * args.context_parallel_size, num_seqs.sum(), {"lm loss": averaged_loss}
+ 
++from crystalllm.patch import crystal_patch_response
++
++@crystal_patch_response
+ def forward_step(data_iterator, model):
+     """Forward training step.
+ 
+@@ -197,6 +200,11 @@ def forward_step(data_iterator, model):
+     else:
+         assert packed_seq_params is None, f"Sequence Packing is not supported for {model}"
+ 
+-    output_tensor = model(**input_kwargs)
++    if os.getenv("CRYSTAL_MODE") == "CAPTURE" and hasattr(model, "_crystal_temp"):
++        output_tensor = getattr(model, "_crystal_temp").clone().detach()
++    else:
++        output_tensor = model(**input_kwargs)
++        if os.getenv("CRYSTAL_MODE") == "CAPTURE":
++            setattr(model, "_crystal_temp", output_tensor.clone().detach())
+ 
+     return output_tensor, partial(loss_func, loss_mask, num_seqs)
+diff --git a/megatron_patch/tokenizer/__init__.py b/megatron_patch/tokenizer/__init__.py
+index 46ece28..47d282e 100644
+--- a/megatron_patch/tokenizer/__init__.py
++++ b/megatron_patch/tokenizer/__init__.py
+@@ -312,7 +312,14 @@ def build_tokenizer(args):
+             def eos_token_id(self):
+                 return self.tokenizer.eos_token_id
+ 
+-        tokenizer = _Qwen3Tokenizer(args.load, args.extra_vocab_size, args.padded_vocab_size)
++        # [Crystal Patch]
++        # Before:
++        # tokenizer = _Qwen3Tokenizer(args.load, args.extra_vocab_size, args.padded_vocab_size)
++        if args.load is None:
++            # For pretrain from scratch tasks, we will not use --load. So we add --patch-tokenizer-path
++            tokenizer = _Qwen3Tokenizer(args.patch_tokenizer_path, args.extra_vocab_size, args.padded_vocab_size)
++        else:
++            tokenizer = _Qwen3Tokenizer(args.load, args.extra_vocab_size, args.padded_vocab_size)
+         if args.padded_vocab_size == 0:
+             args.padded_vocab_size = tokenizer.vocab_size
+ 
+diff --git a/resource/.gitignore b/resource/.gitignore
+new file mode 100644
+index 0000000..81662cc
+--- /dev/null
++++ b/resource/.gitignore
+@@ -0,0 +1 @@
++downloads
+\ No newline at end of file
+diff --git a/resource/get_gpt3.sh b/resource/get_gpt3.sh
+new file mode 100644
+index 0000000..4aefe7e
+--- /dev/null
++++ b/resource/get_gpt3.sh
+@@ -0,0 +1,11 @@
++#!/bin/bash
++
++SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/" && pwd)
++RESOURCE_DIR=${SCRIPT_DIR}/downloads/gpt3
++
++mkdir -p $RESOURCE_DIR
++
++# tokenizer
++mkdir -p $RESOURCE_DIR/tokenizer
++wget https://easynlp-dev.oss-cn-zhangjiakou.aliyuncs.com/225247/RapidformerPro/gpt2-vocab.json -O $RESOURCE_DIR/tokenizer/gpt2-vocab.json
++wget https://easynlp-dev.oss-cn-zhangjiakou.aliyuncs.com/225247/RapidformerPro/gpt2-merges.txt -O $RESOURCE_DIR/tokenizer/gpt2-merges.txt
+diff --git a/resource/get_qwen3.sh b/resource/get_qwen3.sh
+new file mode 100644
+index 0000000..1594960
+--- /dev/null
++++ b/resource/get_qwen3.sh
+@@ -0,0 +1,16 @@
++#!/bin/bash
++
++SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/" && pwd)
++RESOURCE_DIR=${SCRIPT_DIR}/downloads/qwen3
++
++mkdir -p $RESOURCE_DIR
++
++# Dataset files must be supplied by the user.
++mkdir -p $RESOURCE_DIR/dataset
++
++# tokenizer
++mkdir -p $RESOURCE_DIR/tokenizer
++wget https://www.modelscope.cn/models/Qwen/Qwen3-32B/resolve/master/vocab.json -O $RESOURCE_DIR/tokenizer/vocab.json
++wget https://www.modelscope.cn/models/Qwen/Qwen3-32B/resolve/master/merges.txt -O $RESOURCE_DIR/tokenizer/merges.txt
++wget https://www.modelscope.cn/models/Qwen/Qwen3-32B/resolve/master/tokenizer.json -O $RESOURCE_DIR/tokenizer/tokenizer.json
++wget https://www.modelscope.cn/models/Qwen/Qwen3-32B/resolve/master/tokenizer_config.json -O $RESOURCE_DIR/tokenizer/tokenizer_config.json

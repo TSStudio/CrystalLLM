@@ -1,0 +1,909 @@
+diff --git a/megatron/core/model_parallel_config.py b/megatron/core/model_parallel_config.py
+index fc0041a0..278fa572 100644
+--- a/megatron/core/model_parallel_config.py
++++ b/megatron/core/model_parallel_config.py
+@@ -259,7 +259,12 @@ class ModelParallelConfig:
+        overlap_p2p_comm is True.
+     """
+ 
+-    batch_p2p_sync: bool = True
++    # [Crystal Patch]
++    # Before
++    # batch_p2p_sync: bool = True
++    batch_p2p_sync: bool = False
++    # Force batch_p2p_sync to True since there seems no racing condition in new version of PyTorch
++    # batch_p2p_sync was forced to True in a commit in 2022 and an issue in 2025 report that it maybe useless
+     """When using batch_isend_irecv, do a cuda.device.synchronize afterward to work around a bug in
+        older version of PyTorch.
+     """
+diff --git a/megatron/core/parallel_state.py b/megatron/core/parallel_state.py
+index d9eae535..71dee0bd 100644
+--- a/megatron/core/parallel_state.py
++++ b/megatron/core/parallel_state.py
+@@ -170,6 +170,13 @@ def create_group(
+     group_desc=None,
+ ):
+     """Creates a ProcessGroup."""
++    # [Crystal Patch]
++    # Add a unique group description
++    group_desc_additional = f"{torch.distributed.get_rank()}-{torch.distributed.get_pg_count()}-{backend if backend is not None else 'nccl'}"
++    if group_desc is not None:
++        group_desc += "-" + group_desc_additional
++    else:
++        group_desc = group_desc_additional
+     kwargs = {
+         'ranks': ranks,
+         'timeout': timeout,
+diff --git a/megatron/core/pipeline_parallel/schedules.py b/megatron/core/pipeline_parallel/schedules.py
+index 21c9de8b..0c1f2ec7 100644
+--- a/megatron/core/pipeline_parallel/schedules.py
++++ b/megatron/core/pipeline_parallel/schedules.py
+@@ -23,6 +23,8 @@ from megatron.core.utils import (
+     nvtx_range_push,
+ )
+ 
++from crystalllm.runtime import cond_crystal_graph_mark
++
+ # Types
+ Shape = Union[List[int], torch.Size]
+ 
+@@ -179,8 +181,15 @@ def set_current_microbatch(model, microbatch_id):
+     if decoder_exists and decoder is not None:
+         for layer in decoder.layers:
+             layer.current_microbatch = microbatch_id
++            if hasattr(layer, "mlp") and hasattr(layer.mlp, "set_current_microbatch"):
++                layer.mlp.set_current_microbatch(microbatch_id)
++
++
++from crystalllm.patch import cond_crystal_patch_request, CrystalPatchRequest, CrystalPatchPlan, BehaviorType, PatchType
++from crystalllm.nn import ParameterSTE
+ 
+ 
++@cond_crystal_graph_mark("FWD")
+ def forward_step(
+     forward_step_func,
+     data_iterator,
+@@ -284,13 +293,42 @@ def forward_step(
+         context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
+     else:
+         context_manager = contextlib.nullcontext()
+-    with context_manager:
+-        if checkpoint_activations_microbatch is None:
+-            output_tensor, loss_func = forward_step_func(data_iterator, model)
+-        else:
+-            output_tensor, loss_func = forward_step_func(
+-                data_iterator, model, checkpoint_activations_microbatch
+-            )
++
++    # [Crystal Ad hoc]
++    # During Crystal capture, forward_step_func is still executed to produce the real
++    # forward output, but the captured pipeline segment also needs an explicit autograd
++    # edge from the incoming pipeline tensor to that output. ParameterSTE keeps the
++    # original forward output value and returns zero gradient for input_tensor[0], so
++    # this artificial dependency will not propagate extra gradients across stages.
++    patch_context_manager = cond_crystal_patch_request(
++        CrystalPatchRequest(
++            patch_func=forward_step_func,
++            capture_behavior=BehaviorType.EXEC_THEN_PATCH,
++            emulate_behavior=BehaviorType.ONLY_EXEC,
++            patch_plan=[
++                CrystalPatchPlan(
++                    patch_type=PatchType.RES,
++                    position=0,
++                    action=lambda x: ParameterSTE.apply(
++                        input_tensor[0],
++                        lambda _: x,
++                        lambda t_i, _: torch.zeros(
++                            t_i.shape, device="cuda") if t_i is not None else None
++                    ),
++                ),
++            ],
++            patch_res_length=2,
++        ),
++    )
++
++    with patch_context_manager:
++        with context_manager:
++            if checkpoint_activations_microbatch is None:
++                output_tensor, loss_func = forward_step_func(data_iterator, model)
++            else:
++                output_tensor, loss_func = forward_step_func(
++                    data_iterator, model, checkpoint_activations_microbatch
++                )
+ 
+     model_vp_stage = getattr(model, "vp_stage", None)
+     if vp_stage is not None and model_vp_stage is not None:
+@@ -365,6 +403,7 @@ def forward_step(
+     return [output_tensor], num_tokens
+ 
+ 
++@cond_crystal_graph_mark("BWD")
+ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
+     """Backward step through passed-in output tensor.
+ 
+diff --git a/megatron/core/transformer/moe/moe_layer.py b/megatron/core/transformer/moe/moe_layer.py
+index 626d7688..697df6cf 100644
+--- a/megatron/core/transformer/moe/moe_layer.py
++++ b/megatron/core/transformer/moe/moe_layer.py
+@@ -9,7 +9,7 @@ import torch
+ from megatron.core import parallel_state, tensor_parallel
+ from megatron.core.process_groups_config import ModelCommProcessGroups
+ from megatron.core.transformer.module import MegatronModule
+-from megatron.core.transformer.moe.moe_utils import get_default_model_comm_pgs
++from megatron.core.transformer.moe.moe_utils import get_default_model_comm_pgs, save_to_balance_recoder
+ from megatron.core.transformer.moe.router import TopKRouter
+ from megatron.core.transformer.moe.token_dispatcher import (
+     MoEAllGatherTokenDispatcher,
+@@ -75,6 +75,7 @@ class BaseMoELayer(MegatronModule, ABC):
+         self.shared_experts = None
+         self.token_dispatcher: Optional[MoETokenDispatcher] = None
+         self.layer_number = layer_number
++        self.current_microbatch = None
+ 
+     @abstractmethod
+     def forward(self, hidden_states):
+@@ -86,6 +87,11 @@ class BaseMoELayer(MegatronModule, ABC):
+         self.layer_number = layer_number
+         self.router.set_layer_number(layer_number)
+ 
++    def set_current_microbatch(self, microbatch_id: int):
++        """Set the current microbatch for the MoE layer."""
++        self.current_microbatch = microbatch_id
++        self.router.set_current_microbatch(microbatch_id)
++
+ 
+ class MoELayer(BaseMoELayer):
+     """Mixture of Experts layer.
+@@ -201,6 +207,8 @@ class MoELayer(BaseMoELayer):
+         dispatched_input, tokens_per_expert, permuted_probs = (
+             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
+         )
++        if self.config.moe_enable_crystal_balance_recoder:
++            save_to_balance_recoder(dispatched_input.size(0), tokens_per_expert)
+         expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
+         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+         output = self.token_dispatcher.combine_preprocess(expert_output)
+diff --git a/megatron/core/transformer/moe/moe_utils.py b/megatron/core/transformer/moe/moe_utils.py
+index b6732491..8bf80aed 100644
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -23,10 +23,16 @@ try:
+ except ImportError:
+     HAVE_TE = False
+ 
++from crystalllm.moe import BalanceRecorder, MockRouter
+ 
+ # MOE logging
+ _MOE_LAYER_WISE_LOGGING_TRACKER = {}
+ 
++_MOE_LAYER_WISE_BALANCE_RECODER = BalanceRecorder()
++
++_MOE_LOCAL_LAYERS_NUMBER_MAP = {}
++_MOE_MOCK_ROUTER = MockRouter()
++
+ 
+ def switch_load_balancing_loss_func(
+     probs: torch.Tensor,
+@@ -679,6 +685,23 @@ def clear_aux_losses_tracker():
+         tracker[name]["avg_group"] = None
+ 
+ 
++def save_to_balance_recoder(
++    recv_count_per_device: int,
++    recv_count_per_expert: torch.Tensor,
++):
++    tracker = get_moe_layer_wise_balance_recoder()
++    tracker.save(
++        recv_count_per_device,
++        recv_count_per_expert
++    )
++
++
++def clear_balance_recoder():
++    """Clear the balance tracker."""
++    tracker = get_moe_layer_wise_balance_recoder()
++    tracker.clear()
++
++
+ def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = None):
+     """Collect and reduce the auxiliary losses across ranks."""
+     tracker = get_moe_layer_wise_logging_tracker()
+@@ -711,6 +734,8 @@ def track_moe_metrics(
+     track_names: Optional[List[str]] = None,
+     num_layers: Optional[int] = None,
+     moe_layer_freq: Optional[Union[int, List[int]]] = None,
++    add_crystal_balance_recoder: bool = False,
++    moe_ideal_tokens_per_device: float = None,
+ ):
+     """Track the MoE metrics for logging."""
+     # Aux loss logging
+@@ -738,15 +763,23 @@ def track_moe_metrics(
+     else:
+         raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
+ 
+-    if writer is not None:
+-        aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
+-        for name, loss_list in aux_losses.items():
+-            if total_loss_dict is not None:
+-                if name not in total_loss_dict:
+-                    total_loss_dict[name] = loss_list.sum() / num_moe_layers
+-                else:
+-                    total_loss_dict[name] += loss_list.sum() / num_moe_layers
++    # [Crystal Bug Fix]
++    # Calculate auxiliary losses even when tensorboard is disabled.
++    aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
++    for name, loss_list in aux_losses.items():
++        if total_loss_dict is not None:
++            if name not in total_loss_dict:
++                total_loss_dict[name] = loss_list.sum() / num_moe_layers
++            else:
++                total_loss_dict[name] += loss_list.sum() / num_moe_layers
++
++    if add_crystal_balance_recoder:
++        assert moe_ideal_tokens_per_device is not None
++        # metric: {br_avg(+/-br_std), br_min~br_max, br_med, br_skew} t[10|20|50] f[10|20|50] e[10|20|50]
++        tracker = get_moe_layer_wise_balance_recoder()
++        total_loss_dict["crystal_moe_br"] = tracker.calculate_balance_ratio(moe_ideal_tokens_per_device)
+ 
++    if writer is not None:
+             # currently when using add_scalars,
+             # torch.utils.add_scalars makes each timer its own run, which
+             # polutes the runs list, so we just add each as a scalar
+@@ -770,6 +803,8 @@ def track_moe_metrics(
+                     )
+ 
+     clear_aux_losses_tracker()
++    if add_crystal_balance_recoder:
++        clear_balance_recoder()
+ 
+ 
+ def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_rate):
+@@ -817,6 +852,12 @@ def get_moe_layer_wise_logging_tracker():
+     return _MOE_LAYER_WISE_LOGGING_TRACKER
+ 
+ 
++def get_moe_layer_wise_balance_recoder():
++    """Return the moe layer wise balance tracker."""
++    global _MOE_LAYER_WISE_BALANCE_RECODER
++    return _MOE_LAYER_WISE_BALANCE_RECODER
++
++
+ class RandomSTE(torch.autograd.Function):
+     """
+     Straight-Through Estimator(STE) function that returns random values
+@@ -857,6 +898,27 @@ def apply_random_logits(logits):
+     return RandomSTE.apply(logits)
+ 
+ 
++def get_moe_local_layers_number_map():
++    global _MOE_LOCAL_LAYERS_NUMBER_MAP
++    return _MOE_LOCAL_LAYERS_NUMBER_MAP
++
++
++def set_moe_local_layers_number_map(moe_local_layers_number_map):
++    global _MOE_LOCAL_LAYERS_NUMBER_MAP
++    _MOE_LOCAL_LAYERS_NUMBER_MAP = moe_local_layers_number_map
++
++
++def get_moe_mock_router():
++    global _MOE_MOCK_ROUTER
++    return _MOE_MOCK_ROUTER
++
++def apply_mock_logits(logits, current_microbatch, layer_number):
++    moe_local_layers_number_map = get_moe_local_layers_number_map()
++    moe_mock_router = get_moe_mock_router()
++
++    return moe_mock_router.apply_mock_logits(logits, current_microbatch * len(moe_local_layers_number_map.keys()) + moe_local_layers_number_map[layer_number])
++
++
+ class RouterGatingLinearFunction(torch.autograd.Function):
+     """
+     Autograd function for router gating linear.
+diff --git a/megatron/core/transformer/moe/router.py b/megatron/core/transformer/moe/router.py
+index 276afc1a..69835947 100644
+--- a/megatron/core/transformer/moe/router.py
++++ b/megatron/core/transformer/moe/router.py
+@@ -10,6 +10,7 @@ from megatron.core.transformer.module import MegatronModule
+ from megatron.core.transformer.moe.moe_utils import (
+     ModelCommProcessGroups,
+     MoEAuxLossAutoScaler,
++    apply_mock_logits,
+     apply_random_logits,
+     router_gating_linear,
+     save_to_aux_losses_tracker,
+@@ -53,6 +54,7 @@ class Router(ABC, MegatronModule):
+         # So we need to know if the model is configured to calculate per token loss.
+         self.calculate_per_token_loss = self.config.calculate_per_token_loss
+         self.reset_parameters()
++        self.current_microbatch = None
+ 
+     def reset_parameters(self):
+         """Reset the router parameters."""
+@@ -109,6 +111,10 @@ class Router(ABC, MegatronModule):
+         """Set the layer number for the router."""
+         self.layer_number = layer_number
+ 
++    def set_current_microbatch(self, microbatch_id: int):
++        """Set the current microbatch for the MoE layer."""
++        self.current_microbatch = microbatch_id
++
+ 
+ class TopKRouter(Router):
+     """Route each token to the top-k experts."""
+@@ -444,6 +450,8 @@ class TopKRouter(Router):
+         if self.config.moe_router_force_load_balancing:
+             # Apply force load balancing with random logits for benchmark
+             logits = apply_random_logits(logits)
++        elif self.config.moe_use_crystal_mock_router:
++            logits = apply_mock_logits(logits, self.current_microbatch, self.layer_number)
+ 
+         scores, routing_map = self.routing(logits)
+ 
+diff --git a/megatron/core/transformer/moe/token_dispatcher.py b/megatron/core/transformer/moe/token_dispatcher.py
+index b10b051a..f9c4da1e 100644
+--- a/megatron/core/transformer/moe/token_dispatcher.py
++++ b/megatron/core/transformer/moe/token_dispatcher.py
+@@ -490,12 +490,38 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
+             # num_global_tokens_per_expert represents the number of tokens sent to each
+             # expert by all ranks.
+             # [tp_size, ep_size, num_experts]
+-            num_global_tokens_per_expert = (
+-                gather_from_sequence_parallel_region(
+-                    num_local_tokens_per_expert, group=self.tp_ep_group
++            # [Crystal Ad hoc]
++            # In the preprocess of token dispatch, the output_split_sizes will be calculated by
++            # the result of an all_gather_into_tensor. Later a buffer will be allocated to store
++            # the result of all_to_all_single and it will use output_split_sizes to decided the
++            # size to allocate. If the result of all_gather_into_tensor is just junk data got from
++            # torch.empty, the buffer size maybe be either overflow or underflow.
++            # We manually modify the result, force the size from other ranks to zeros, so that the
++            # buffer size will correspongding to the tokens dispatched to itself.
++            from crystalllm.patch import cond_crystal_patch_request, CrystalPatchRequest, CrystalPatchPlan, BehaviorType, PatchType
++
++            def _preprocess_expteced(_tokens: torch.Tensor):
++                _tokens.fill_(0).view(torch.distributed.get_world_size(self.tp_ep_group), -1)[torch.distributed.get_rank(self.tp_ep_group)] = num_local_tokens_per_expert
++
++            with cond_crystal_patch_request(
++                request=CrystalPatchRequest(
++                    patch_func=torch.distributed.all_gather_into_tensor,
++                    capture_behavior=BehaviorType.ONLY_PATCH,
++                    emulate_behavior=BehaviorType.ONLY_EXEC,
++                    patch_plan=CrystalPatchPlan(
++                        patch_type=PatchType.ARGS,
++                        position=0,
++                        action=_preprocess_expteced
++                    ),
++                    patch_res_length=0
+                 )
+-                .reshape(self.ep_size, self.tp_size, self.num_experts)
+-                .transpose(0, 1)
++            ):
++                num_global_tokens_per_expert = (
++                    gather_from_sequence_parallel_region(
++                        num_local_tokens_per_expert, group=self.tp_ep_group
++                    )
++                    .reshape(self.ep_size, self.tp_size, self.num_experts)
++                    .transpose(0, 1)
+             )
+             # [tp_size, ep_size, num_experts] -> [tp_size, ep_size, num_local_experts]
+             num_global_tokens_per_local_expert = num_global_tokens_per_expert[
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index a256d70f..64ebb94b 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -510,6 +510,12 @@ class TransformerConfig(ModelParallelConfig):
+     moe_apply_probs_on_input: bool = False
+     """Apply probs on input of experts instead of applying after activation and glu."""
+ 
++    moe_enable_crystal_balance_recoder: bool = False
++    """Enable CrystalLLM Balance Recoder for MoE balance ratio recording"""
++
++    moe_use_crystal_mock_router: bool = False
++    """Use CrystalLLM Mock Router for MoE router gating."""
++
+     ##################
+     # Context Parallel
+     ##################
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index 9d07f483..83b2a0b0 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -944,6 +944,12 @@ def validate_args(args, defaults={}):
+         args.moe_ffn_hidden_size = args.ffn_hidden_size
+         print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
+ 
++    if args.moe_use_crystal_mock_router:
++        assert args.num_experts is not None, "num_experts must be non None to use CrystalLLM Mock Router"
++        assert args.moe_mock_router_br_min is not None and args.moe_mock_router_br_max is not None, "Balance ratio minimum and maximum must be set when using CrystalLLM Mock Router"
++        if args.moe_mock_router_f10_avg is None or args.moe_mock_router_f20_avg is None or args.moe_mock_router_f50_avg is None:
++            assert args.moe_mock_router_f10_avg is None and args.moe_mock_router_f20_avg is None and args.moe_mock_router_f50_avg is None, "f10_avg, f20_avg, f50_avg must be set or unset simultaneously"
++
+     # Context parallel
+     if args.context_parallel_size > 1:
+         assert not args.use_legacy_models, "Context parallelism is not supported in legacy models."
+@@ -1802,7 +1808,11 @@ def _add_training_args(parser):
+                        help='Use the built-in pytorch profiler. '
+                        'Useful if you wish to view profiles in tensorboard.',
+                        dest='use_pytorch_profiler')
+-    group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
++    # [Crystal Debug]
++    # Before:
++    # group.add_argument('--profile-ranks', nargs='+', type=int, default=[0],
++    # For debug purposes, profile will performed on all nodes
++    group.add_argument('--profile-ranks', nargs='+', type=int, default=list(range(int(os.getenv('WORLD_SIZE', '1')))),
+                        help='Global ranks to profile.')
+     group.add_argument('--record-memory-history', action="store_true", default=False,
+                        help='Record memory history in last rank.')
+@@ -2812,6 +2822,31 @@ def _add_moe_args(parser):
+     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
+                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
+                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
++    group.add_argument('--moe-enable-crystal-balance-recoder', action='store_true',
++                       help="Enable CrystalLLM Balance Recoder for MoE balance ratio recording")
++    group.add_argument('--moe-use-crystal-mock-router', action='store_true',
++                       help='Use CrystalLLM Mock Router for MoE router gating.')
++    group.add_argument('--moe-mock-router-objective', default='smooth',
++                       choices=['smooth', 'smooth_shuffle', 'max_1f1b'],
++                       help='Objective for CrystalLLM Mock Router')
++    group.add_argument('--moe-mock-router-br-min', type=float, default=None,
++                        help='Balance ratio minimum for CrystalLLM Mock Router')
++    group.add_argument('--moe-mock-router-br-max', type=float, default=None,
++                        help='Balance ratio maximum for CrystalLLM Mock Router')
++    group.add_argument('--moe-mock-router-br-avg', type=float, default=None,
++                        help='Balance ratio average for CrystalLLM Mock Router')
++    group.add_argument('--moe-mock-router-br-std', type=float, default=None,
++                        help='Balance ratio standard deviation for CrystalLLM Mock Router')
++    group.add_argument('--moe-mock-router-br-med', type=float, default=None,
++                        help='Balance ratio median for CrystalLLM Mock Router')
++    group.add_argument('--moe-mock-router-br-skew', type=float, default=None,
++                        help='Balance ratio skewness for CrystalLLM Mock Router')
++    group.add_argument('--moe-mock-router-f10-avg', type=float, default=None,
++                        help='Percentage of average tokens received by the top 10 percent of experts sorted by index for CrystalLLM Mock Router')
++    group.add_argument('--moe-mock-router-f20-avg', type=float, default=None,
++                        help='Percentage of average tokens received by the top 20 percent of experts sorted by index for CrystalLLM Mock Router')
++    group.add_argument('--moe-mock-router-f50-avg', type=float, default=None,
++                        help='Percentage of average tokens received by the top 50 percent of experts sorted by index for CrystalLLM Mock Router')
+     return parser
+ 
+ def _add_mla_args(parser):
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index d32aca01..3a672a10 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -716,6 +716,9 @@ def pretrain(
+         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
+             it is automatically injected when in-process restart is in use
+     """
++    from crystalllm.runtime import initialize_crystal_runtime, destroy_crystal_runtime
++
++    initialize_crystal_runtime()
+ 
+     if inprocess_call_wrapper is not None:
+         iteration = inprocess_call_wrapper.iteration
+@@ -942,6 +945,8 @@ def pretrain(
+     ft_integration.shutdown()
+     one_logger_utils.finish()
+ 
++    destroy_crystal_runtime()
++
+ 
+ def update_train_iters(args):
+ 
+@@ -1222,6 +1227,74 @@ def setup_model_and_optimizer(
+     model = get_model(model_provider_func, model_type)
+     unwrapped_model = unwrap_model(model)
+ 
++    if args.moe_use_crystal_mock_router:
++        from crystalllm.moe import calculate_br_list_from_statistics
++        from megatron.core.models.gpt import GPTModel
++        from megatron.core.num_microbatches_calculator import get_num_microbatches
++        from megatron.core.transformer.moe.moe_layer import MoELayer
++        from megatron.core.transformer.moe.moe_utils import get_moe_mock_router, set_moe_local_layers_number_map
++
++        num_of_microbatches = get_num_microbatches()
++        print_rank_0("Num of micro batches: ", num_of_microbatches)
++
++        num_of_local_moe_layers = 0
++        local_moe_layer_number_set = set()
++        for model_chunk in unwrapped_model:
++            if isinstance(model_chunk, GPTModel):
++                for layer in model_chunk.decoder.layers:
++                    if isinstance(layer.mlp, MoELayer):
++                        num_of_local_moe_layers += 1
++                        local_moe_layer_number_set.add(layer.mlp.layer_number)
++
++        moe_local_layers_number_map = {n: i for i, n in enumerate(sorted(local_moe_layer_number_set))}
++        print_rank_0("Num of local moe layers: ", num_of_local_moe_layers)
++        print_rank_0("Layer Number map of local moe layers", moe_local_layers_number_map)
++        set_moe_local_layers_number_map(moe_local_layers_number_map)
++
++        br_list_device0 = calculate_br_list_from_statistics(
++            num_of_microbatches * num_of_local_moe_layers,
++            args.moe_mock_router_objective,
++            args.moe_mock_router_br_min,
++            args.moe_mock_router_br_max,
++            args.moe_mock_router_br_avg,
++            args.moe_mock_router_br_std,
++            args.moe_mock_router_br_med,
++            args.moe_mock_router_br_skew,
++            num_of_local_moe_layers,
++            mpu.get_pipeline_model_parallel_world_size()
++        )
++
++        local_tokens_per_device = int(
++            args.micro_batch_size
++            * args.seq_length
++            / mpu.get_context_parallel_world_size()
++            / (mpu.get_tensor_model_parallel_world_size() if args.sequence_parallel else 1)
++        )
++
++        if args.moe_router_dtype == 'fp32':
++            logits_dtype = torch.float32
++        elif args.moe_router_dtype == 'fp64':
++            logits_dtype = torch.float64
++        else:
++            logits_dtype = args.params_dtype
++
++        get_moe_mock_router().initialize(
++            args.num_experts,
++            mpu.get_expert_model_parallel_world_size(),
++            [br_list_device0],
++            [[
++                args.moe_mock_router_f10_avg,
++                args.moe_mock_router_f20_avg,
++                args.moe_mock_router_f50_avg,
++            ]] if args.moe_mock_router_f10_avg is not None
++               else [],
++            args.moe_router_topk,
++            local_tokens_per_device,
++            num_of_microbatches * num_of_local_moe_layers,
++            args.micro_batch_size,
++            logits_dtype
++        )
++
+     kwargs = {}
+     for f in dataclasses.fields(OptimizerConfig):
+         if hasattr(args, f.name):
+@@ -1657,6 +1730,13 @@ def training_log(
+             track_names.append("load_balancing_loss")
+         if args.moe_z_loss_coeff is not None:
+             track_names.append("z_loss")
++        moe_ideal_tokens_per_device = int(
++            args.micro_batch_size
++            * args.seq_length
++            * args.moe_router_topk
++            / mpu.get_context_parallel_world_size()
++            / (mpu.get_tensor_model_parallel_world_size() if args.sequence_parallel else 1)
++        )
+         track_moe_metrics(
+             loss_scale=moe_loss_scale,
+             iteration=iteration,
+@@ -1668,7 +1748,11 @@ def training_log(
+             track_names=track_names,
+             num_layers=args.num_layers,
+             moe_layer_freq=args.moe_layer_freq,
++            add_crystal_balance_recoder=args.moe_enable_crystal_balance_recoder,
++            moe_ideal_tokens_per_device=moe_ideal_tokens_per_device
+         )
++        if args.moe_enable_crystal_balance_recoder:
++            crystal_moe_br = total_loss_dict.pop("crystal_moe_br")
+     if args.mtp_num_layers is not None:
+         mtp_loss_scale = 1 / get_num_microbatches()
+         MTPLossLoggingHelper.track_mtp_metrics(
+@@ -1752,6 +1836,8 @@ def training_log(
+             total_loss_dict[skipped_iters_key]
+         )
+         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
++        if args.moe_enable_crystal_balance_recoder:
++            log_string += ' moe balance ratio: {} |'.format(crystal_moe_br)
+         total_loss_dict[advanced_iters_key] = 0
+         total_loss_dict[skipped_iters_key] = 0
+         total_loss_dict[nan_iters_key] = 0
+@@ -1910,16 +1996,33 @@ def post_training_step_callbacks(
+         check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_scheduler)
+ 
+     # Profiling.
++    # [Crystal Patch]
++    # Before:
++    # if (
++    #     args.profile
++    #     and iteration == args.profile_step_end
++    #     and torch.distributed.get_rank() in args.profile_ranks
++    # ):
++    #     if args.use_pytorch_profiler:
++    #         assert prof is not None
++    #         prof.stop()
++    #     else:
++    #         torch.cuda.cudart().cudaProfilerStop()
++    # elif iteration == args.profile_step_start:
+     if (
+         args.profile
+-        and iteration == args.profile_step_end
+         and torch.distributed.get_rank() in args.profile_ranks
+     ):
+         if args.use_pytorch_profiler:
+-            assert prof is not None
+-            prof.stop()
++            if iteration == args.profile_step_end:
++                assert prof is not None
++                prof.stop()
+         else:
+-            torch.cuda.cudart().cudaProfilerStop()
++            if (iteration + 1) == args.profile_step_end:
++                torch.cuda.cudart().cudaProfilerStop()
++    # PyTorch or NCCL Profiler step equals to iteration + 1 since the the call of
++    # step() is at the beginning of each iteration. This will make the behavior
++    # consistent with the Pytorch or NCCL Profiler.
+ 
+     # Manual garbage collection.
+     if args.manual_gc:
+@@ -2191,12 +2294,61 @@ def train(
+                 active=args.profile_step_end - args.profile_step_start,
+                 repeat=1,
+             ),
+-            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
+-            record_shapes=True,
+-            with_stack=True,
++            # [Crystal Patch]
++            # Before:
++            # on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
++            # worker_name is needed for trace analysis
++            on_trace_ready=torch.profiler.tensorboard_trace_handler(
++                dir_name=os.path.join(os.getenv("CRYSTAL_LOG_DIR"), "profiler", "pytorch"),
++                worker_name="agent_" + os.getenv("RANK"),
++                use_gzip=True
++            ),
++            # [Crystal Patch]
++            # Before:
++            # record_shapes=True,
++            # with_stack=True,
++            # record_shapes and with_stack will brigh very high overhead and they are unnecessary
+         )
+         prof.start()
+ 
++    nccl_profiler = None
++    if os.getenv("ENABLE_NCCL_PROFILER") is not None:
++        from crystalllm_nccl_profiler import nccl_profiler
++        nccl_profiler.schedule(
++            profile_step_start=args.profile_step_start,
++            profile_step_end=args.profile_step_end
++        )
++
++    crystal_monitor = None
++    if os.getenv("ENABLE_CRYSTAL_MONITOR") is not None:
++        from crystalllm.monitor import CrystalMonitor, MonitorType
++        from crystalllm.monitor.util import get_dual_network_interfaces_for_gpu
++        gpu_index = int(os.getenv("LOCAL_RANK"))
++        crystal_monitor = CrystalMonitor(
++            dir_name=os.path.join(os.getenv("CRYSTAL_LOG_DIR"), "monitor"),
++            worker_name=os.getenv("RANK"),
++            monitor_types=[MonitorType.MEMORY],
++            gpu_index=gpu_index,
++            network_interfaces=get_dual_network_interfaces_for_gpu(gpu_index)
++        )
++
++    crystal_timers = None
++    if os.getenv("ENABLE_CRYSTAL_TIMER") is not None:
++        from crystalllm.timer import CrystalTimers
++        crystal_timers = CrystalTimers(
++            record_host_time=False,
++            record_device_time=True,
++            step_start=args.profile_step_start,
++            step_end=args.profile_step_end,
++            handlers=[
++                CrystalTimers.LogHandler(),
++                CrystalTimers.JSONHandler(
++                    dir_name=os.path.join(os.getenv("CRYSTAL_LOG_DIR"), "timer"),
++                    worker_name="timer_" + os.getenv("RANK")
++                )
++            ]
++        )
++
+     start_iteration = iteration
+     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
+     # or random initialization don't propagate to all ranks in first all-gather (which is a
+@@ -2216,14 +2368,37 @@ def train(
+         torch.distributed.barrier()
+         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
+ 
++    from crystalllm.runtime import crystal_runtime_step_start, crystal_runtime_step_stop
++
+     # Run training iterations till done.
+     while iteration < args.train_iters:
+         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
+             if args.use_pytorch_profiler:
+                 prof.step()
+-            elif iteration == args.profile_step_start:
++            # [Crystal Patch]
++            # Before:
++            # elif iteration == args.profile_step_start:
++            elif (iteration + 1) == args.profile_step_start:
++            # PyTorch or NCCL Profiler step equals to iteration + 1 since the the call of
++            # step() is at the beginning of each iteration. This will make the behavior
++            # consistent with the Pytorch or NCCL Profiler.
+                 torch.cuda.cudart().cudaProfilerStart()
+-                torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
++                # [Crystal Patch]
++                # Before:
++                # torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
++                # record_shapes will brigh very high overhead and they are unnecessary
++
++        if nccl_profiler is not None:
++            nccl_profiler.step()
++
++        if crystal_monitor is not None:
++            if (iteration + 1) == args.profile_step_start:
++                crystal_monitor.start_measure()
++            if (iteration + 1) == args.profile_step_end:
++                crystal_monitor.end_measure()
++
++        if crystal_timers is not None:
++            crystal_timers.step()
+ 
+         ft_integration.on_checkpointing_start()
+         maybe_finalize_async_save(blocking=False)
+@@ -2266,6 +2441,7 @@ def train(
+ 
+         # Run training step.
+         args.curr_iteration = iteration
++        crystal_runtime_step_start()
+         ft_integration.on_training_step_start()
+         (
+             loss_dict,
+@@ -2279,6 +2455,7 @@ def train(
+             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config
+         )
+         ft_integration.on_training_step_end()
++        crystal_runtime_step_stop()
+         if should_checkpoint:
+             save_checkpoint_and_time(
+                 iteration,
+@@ -2421,6 +2598,17 @@ def train(
+         if should_exit:
+             break
+ 
++    if nccl_profiler is not None:
++        nccl_profiler.set_group_desc_and_save(
++            dir_name=os.path.join(os.getenv("CRYSTAL_LOG_DIR"), "profiler", "nccl"),
++            worker_name="agent_" + os.getenv("RANK"),
++            search_for_single_p2p_comm=lambda pg:
++                pg.group_desc.startswith("PIPELINE") or (pg.group_desc == "default_pg" and mpu.get_pipeline_model_parallel_world_size() == 2)
++        )
++
++    if crystal_timers is not None:
++        crystal_timers.stop()
++
+     one_logger_utils.track_e2e_metrics()
+ 
+     # Flush TensorBoard, WandB writers and one-logger.
+@@ -2754,7 +2942,32 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
+     else:
+         flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
+ 
+-    torch.distributed.broadcast(flags, 0)
++    # [Crystal Ad hoc]
++    # If a rank's tp_rank==0, the flags to broadcast is [1, 0, 0], which means do_train
++    # but not do_valid/do_test. If a rank's tp_rank>0, the flags "to broadcast" (src==0,
++    # will be the receiver) is [0, 0, 0], which means nothing to do.
++    # In normal cases, flags will be broadcasted from (global_)rank==0 to other ranks.
++    # But when communication capturing is enabled, we must modify the tensor manually.
++    from crystalllm.patch import cond_crystal_patch_request, CrystalPatchRequest, CrystalPatchPlan, BehaviorType, PatchType
++
++    def _dataloader_expected(_flags: torch.Tensor):
++        _flags[0] = 1
++        _flags[1] = 0
++        _flags[2] = 0
++
++    with cond_crystal_patch_request(
++        request=CrystalPatchRequest(
++            patch_func=torch.distributed.broadcast,
++            capture_behavior=BehaviorType.EXEC_THEN_PATCH,
++            emulate_behavior=BehaviorType.EXEC_THEN_PATCH,
++            patch_plan=CrystalPatchPlan(
++                patch_type=PatchType.ARGS,
++                position=0,
++                action=_dataloader_expected
++            )
++        )
++    ):
++        torch.distributed.broadcast(flags, 0)
+ 
+     args.do_train = getattr(args, "do_train", False) or flags[0].item()
+     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
+diff --git a/megatron/training/utils.py b/megatron/training/utils.py
+index 698c5a07..4e8764a8 100644
+--- a/megatron/training/utils.py
++++ b/megatron/training/utils.py
+@@ -357,14 +357,19 @@ def get_ltor_masks_and_position_ids(
+ 
+     return attention_mask, loss_mask, position_ids
+ 
+-
+-def print_rank_0(message):
+-    """If distributed is initialized, print only on rank 0."""
+-    if torch.distributed.is_initialized():
+-        if torch.distributed.get_rank() == 0:
+-            print(message, flush=True)
+-    else:
+-        print(message, flush=True)
++# [Crystal Debug]
++# Before:
++# def print_rank_0(message):
++#     """If distributed is initialized, print only on rank 0."""
++#     if torch.distributed.is_initialized():
++#         if torch.distributed.get_rank() == 0:
++#             print(message, flush=True)
++#     else:
++#         print(message, flush=True)
++def print_rank_0(*message):
++    if int(os.getenv("LOCAL_RANK", "0")) == 0:
++        print(*message, flush=True)
++# For debug purposes, print will performed on all nodes
+ 
+ 
+ def is_rank0():
+@@ -376,13 +381,19 @@ def is_last_rank():
+     return torch.distributed.get_rank() == (torch.distributed.get_world_size() - 1)
+ 
+ 
+-def print_rank_last(message):
+-    """If distributed is initialized, print only on last rank."""
+-    if torch.distributed.is_initialized():
+-        if is_last_rank():
+-            print(message, flush=True)
+-    else:
+-        print(message, flush=True)
++# [Crystal Debug]
++# Before:
++# def print_rank_last(message):
++#     """If distributed is initialized, print only on last rank."""
++#     if torch.distributed.is_initialized():
++#         if is_last_rank():
++#             print(message, flush=True)
++#     else:
++#         print(message, flush=True)
++def print_rank_last(*message):
++    if int(os.getenv("LOCAL_RANK", "0")) == (int(os.getenv("LOCAL_WOLRD_SIZE", "1")) - 1):
++        print(*message, flush=True)
++# For debug purposes, print will performed on all nodes
+ 
+ 
+ def get_device_arch_version():
+@@ -461,12 +472,32 @@ def get_batch_on_this_tp_rank(data_iterator):
+     args = get_args()
+ 
+     def _broadcast(item):
+-        if item is not None:
+-            torch.distributed.broadcast(
+-                item,
+-                mpu.get_tensor_model_parallel_src_rank(),
+-                group=mpu.get_tensor_model_parallel_group(),
++        # [Crystal Ad hoc]
++        # If a rank's tp_rank!=0, the input data are from receiving the broadcast from rank==0,
++        # The input tensor is the result of torch.empty(), whose value is randomly initialized.
++        # So we must manually fill the tensor with zeros so that none of them will overflow the
++        # vocab size and cause an assert error.
++        from crystalllm.patch import cond_crystal_patch_request, CrystalPatchRequest, CrystalPatchPlan, BehaviorType, PatchType
++
++        with cond_crystal_patch_request(
++            request=CrystalPatchRequest(
++                patch_func=torch.distributed.broadcast,
++                capture_behavior=BehaviorType.ONLY_PATCH,
++                emulate_behavior=BehaviorType.ONLY_EXEC,
++                patch_plan=CrystalPatchPlan(
++                    patch_type=PatchType.ARGS,
++                    position=0,
++                    action=lambda x: x.fill_(0)
++                ),
++                patch_res_length=0
+             )
++        ):
++            if item is not None:
++                torch.distributed.broadcast(
++                    item,
++                    mpu.get_tensor_model_parallel_src_rank(),
++                    group=mpu.get_tensor_model_parallel_group(),
++                )
+ 
+     if mpu.get_tensor_model_parallel_rank() == 0:
+ 

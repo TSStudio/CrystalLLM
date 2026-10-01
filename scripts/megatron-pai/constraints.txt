@@ -1,0 +1,3 @@
+# Preserve the NGC 25.06 PyTorch build and NumPy ABI.
+torch==2.8.0a0+5228986c39.nv25.6
+numpy<2

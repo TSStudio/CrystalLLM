@@ -1,0 +1,19 @@
+#!/bin/bash
+#
+# Copyright (c) 2026 Aliyun Inc. All Rights Reserved.
+#
+# CrystalLLM Initialization Script
+#
+# This script sets up a Python virtual environment and installs required dependencies
+# for CrystalLLM. It creates a venv at the current directory and installs packages
+# like redis that are needed for CrystalLLM operation.
+#
+# Usage: crystalllm-init
+#
+
+set -eo pipefail
+
+# Setup virtual environment & Install additional python package dependencies
+python -m venv venv --system-site-packages
+source venv/bin/activate
+pip install redis

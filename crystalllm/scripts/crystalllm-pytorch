@@ -1,0 +1,188 @@
+#!/bin/bash
+#
+# Copyright (c) 2026 Aliyun Inc. All Rights Reserved.
+#
+# CrystalLLM PyTorch Distributed Package Management Script
+#
+# This script manages the replacement and recovery of PyTorch distributed package
+# files with customized versions for CrystalLLM functionality.
+#
+# Usage: crystalllm-pytorch <replace|recover> [options]
+#
+
+set -eo pipefail
+
+REPLACE_FILES=("distributed_c10d.py")
+
+# Function to display usage
+usage() {
+    echo "Usage: $0 <action> [options]"
+    echo ""
+    echo "Actions:"
+    echo "  replace [--source-dir <path>]    Replace PyTorch distributed package with customized one"
+    echo "  recover [--backup-version <ver>] Recover PyTorch distributed package with backup"
+    echo ""
+    echo "Options:"
+    echo "  --source-dir <path>     Path to directory containing source files (distributed_c10d.py)."
+    echo "                          If not specified, uses './patches/pytorch-patch' relative to current directory."
+    echo "  --backup-version <ver>  Backup version to recover from (e.g., '2025.01.15-10.30.00')."
+    echo "                          If not specified, the oldest backup will be used."
+}
+
+# Find system PyTorch packages
+SYSTEM_TORCH_PATH=$(python -c "import torch; import os; print(os.path.dirname(torch.__file__))")
+SYSTEM_TORCH_DISTRIBUTED_PATH="$SYSTEM_TORCH_PATH/distributed"
+
+# Parse arguments
+if [ $# -lt 1 ]; then
+    usage
+    exit 1
+fi
+
+ACTION=$1
+shift
+
+# Artifact default: ./patches/pytorch-patch relative to the current directory.
+SOURCE_DIR=""
+
+# Parse options based on action
+if [ "$ACTION" = "replace" ]; then
+    # Parse options for replace action
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --source-dir)
+                SOURCE_DIR="$2"
+                shift 2
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Error: Unknown option '$1'"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Set default source-dir if not provided
+    if [ -z "$SOURCE_DIR" ]; then
+        SOURCE_DIR="./patches/pytorch-patch"
+    fi
+
+    # Resolve to absolute path
+    SOURCE_DIR=$(cd "$(dirname "$SOURCE_DIR")" 2>/dev/null && pwd)/$(basename "$SOURCE_DIR")
+
+    # Validate source directory
+    if [ ! -d "$SOURCE_DIR" ]; then
+        echo "Error: Source directory not found at: $SOURCE_DIR"
+        echo "Please make sure the source directory exists."
+        exit 1
+    fi
+
+    echo "Source directory: $SOURCE_DIR"
+    echo "System torch distributed package: $SYSTEM_TORCH_DISTRIBUTED_PATH"
+
+    # Validate source files exist
+    for file in "${REPLACE_FILES[@]}"; do
+        SOURCE_FILE_PATH="$SOURCE_DIR/$file"
+        if [ ! -f "$SOURCE_FILE_PATH" ]; then
+            echo "Error: Source file '$SOURCE_FILE_PATH' does not exist"
+            exit 1
+        fi
+    done
+
+    echo "Replacing PyTorch distributed package..."
+
+    TIMESTAMP=$(date "+%Y.%m.%d-%H.%M.%S")
+    BACKUP_PATH="${SYSTEM_TORCH_DISTRIBUTED_PATH}/backup.${TIMESTAMP}"
+    mkdir -p "$BACKUP_PATH"
+    echo "Backup folder created at: $BACKUP_PATH"
+
+    for file in "${REPLACE_FILES[@]}"; do
+        SOURCE_FILE_PATH="$SOURCE_DIR/$file"
+        SYSTEM_FILE_PATH="$SYSTEM_TORCH_DISTRIBUTED_PATH/$file"
+
+        echo "Backing up $file"
+        cp -r "$SYSTEM_FILE_PATH" "$BACKUP_PATH"
+
+        echo "Replacing $file with $SOURCE_FILE_PATH"
+        cp "$SOURCE_FILE_PATH" "$SYSTEM_FILE_PATH"
+    done
+
+    echo "Replacement completed successfully!"
+
+    # Update marker file
+    echo "PyTorch distributed package was replaced on ${TIMESTAMP}" > "$SYSTEM_TORCH_PATH/.custom_distributed_marker"
+
+elif [ "$ACTION" = "recover" ]; then
+    BACKUP_VERSION=""
+
+    # Parse options for recover action
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --backup-version)
+                BACKUP_VERSION="$2"
+                shift 2
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Error: Unknown argument '$1'"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    echo "Recovering PyTorch distributed package..."
+
+    # Get backup versions (oldest first)
+    BACKUP_VERSIONS=($(ls -1 "$SYSTEM_TORCH_DISTRIBUTED_PATH" 2>/dev/null | grep "^backup\." | sort))
+
+    if [ ${#BACKUP_VERSIONS[@]} -eq 0 ]; then
+        echo "Error: No backup found. Please make sure you have run 'replace' before."
+        exit 1
+    fi
+
+    # Determine which backup to use
+    if [ -n "$BACKUP_VERSION" ]; then
+        RECOVER_VERSION="backup.$BACKUP_VERSION"
+        if [ ! -d "$SYSTEM_TORCH_DISTRIBUTED_PATH/$RECOVER_VERSION" ]; then
+            echo "Error: Specified backup version '$BACKUP_VERSION' not found."
+            exit 1
+        fi
+    else
+        RECOVER_VERSION=${BACKUP_VERSIONS[0]}
+    fi
+
+    echo "Recovering from backup: $RECOVER_VERSION"
+
+    # Perform recovery
+    for file in "${REPLACE_FILES[@]}"; do
+        BACKUP_FILE_PATH="$SYSTEM_TORCH_DISTRIBUTED_PATH/$RECOVER_VERSION/$file"
+        SYSTEM_FILE_PATH="$SYSTEM_TORCH_DISTRIBUTED_PATH/$file"
+
+        if [ ! -f "$BACKUP_FILE_PATH" ]; then
+            echo "Error: Backup file '$BACKUP_FILE_PATH' does not exist"
+            exit 1
+        fi
+
+        echo "Recovering $file"
+        cp "$BACKUP_FILE_PATH" "$SYSTEM_FILE_PATH"
+    done
+
+    echo "Recovery completed successfully!"
+
+    # Update marker file
+    TIMESTAMP=$(date "+%Y.%m.%d-%H.%M.%S")
+    echo "PyTorch distributed package was recovered on ${TIMESTAMP} with version ${RECOVER_VERSION}" > "$SYSTEM_TORCH_DISTRIBUTED_PATH/.custom_distributed_marker"
+
+else
+    echo "Error: Unknown action '$ACTION'"
+    usage
+    exit 1
+fi

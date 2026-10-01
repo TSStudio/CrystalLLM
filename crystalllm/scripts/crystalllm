@@ -1,0 +1,86 @@
+#!/bin/bash
+#
+# Copyright (c) 2026 Aliyun Inc. All Rights Reserved.
+#
+# CrystalLLM Main Entry Script
+#
+# This script serves as the main entry point for CrystalLLM commands.
+# It validates subcommands, activates the virtual environment at --crystal-workspace/venv,
+# and delegates execution to the appropriate Python module.
+#
+# Usage: crystalllm <client|run> [options]
+#
+
+set -eo pipefail
+
+# Get subcommand (must be the first argument)
+SUBCOMMAND="$1"
+
+# Validate subcommand
+if [[ -z "$SUBCOMMAND" ]]; then
+    echo "Error: No subcommand specified."
+    echo "Usage: crystalllm <client|run> [options]"
+    exit 1
+fi
+
+# Determine entry module command based on subcommand
+case "$SUBCOMMAND" in
+    client)
+        ENTRY_MODULE="crystalllm.entry.client"
+        ;;
+    run)
+        ENTRY_MODULE="crystalllm.entry.run"
+        ;;
+    *)
+        echo "Error: Unknown subcommand '$SUBCOMMAND'"
+        echo "Usage: crystalllm <client|run> [options]"
+        exit 1
+        ;;
+esac
+
+# Function to extract --crystal-workspace value from arguments
+get_workspace() {
+    local workspace="."
+    local skip_next=false
+
+    for arg in "$@"; do
+        if $skip_next; then
+            workspace="$arg"
+            skip_next=false
+        elif [[ "$arg" == "--crystal-workspace" ]]; then
+            skip_next=true
+        elif [[ "$arg" == --crystal-workspace=* ]]; then
+            workspace="${arg#*=}"
+        fi
+    done
+
+    echo "$workspace"
+}
+
+# Get workspace directory
+WORKSPACE=$(get_workspace "$@")
+WORKSPACE=$(cd "$WORKSPACE" 2>/dev/null && pwd || echo "$WORKSPACE")
+VENV_PATH="$WORKSPACE/venv"
+
+# Check if venv exists
+if [[ ! -d "$VENV_PATH" ]]; then
+    echo "Error: Virtual environment not found at $VENV_PATH"
+    echo "Please run 'crystalllm-init' to initialize the workspace first, then try again."
+    exit 1
+fi
+
+# Check if already running in the target venv by checking VIRTUAL_ENV environment variable
+if [[ -z "$VIRTUAL_ENV" || "$VIRTUAL_ENV" != "$VENV_PATH" ]]; then
+    # Not in the correct venv, need to activate
+    # Source the activate script
+    source "$VENV_PATH/bin/activate"
+fi
+
+# Match the soft nofile limit to the current hard limit so child processes inherit it.
+NOFILE_HARD_LIMIT=$(ulimit -Hn)
+ulimit -Sn "$NOFILE_HARD_LIMIT"
+
+echo "Virtual Envrionment: $VENV_PATH"
+
+shift
+python -m "$ENTRY_MODULE" "$@"

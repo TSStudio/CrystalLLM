@@ -1,0 +1,132 @@
+[project]
+name = "crystalllm"
+version = "26.8.27"
+description = "CrystalLLM is a tool for emulating large language model training"
+dependencies = [
+    "torch>2",
+]
+requires-python = ">=3.10"
+readme = "README.md"
+keywords = ["Deep Learning", "Artificial Intelligence"]
+classifiers = [
+    'Development Status :: 3 - Alpha',
+    'Intended Audience :: Developers',
+    'Intended Audience :: Science/Research',
+    'Programming Language :: Python :: 3',
+    'Topic :: Scientific/Engineering :: Artificial Intelligence']
+
+[build-system]
+requires = [
+    "setuptools>70.1",
+    "wheel",
+    "pybind11",
+]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+preview = true
+output-format = "full"
+exclude = [
+  '.eggs',
+  '.git',
+  'build',
+  'dist',
+  "csrc",
+]
+
+[tool.ruff.lint]
+select = [
+  "F",        # Pyflakes
+  "E", "W",   # pycodestyle
+  "PL",       # Pylint
+  "PERF",     # Perflint
+  "I",        # isort
+  "N",        # pep8-naming
+  "UP",       # pyupgrade
+  "D",        # pydocstyle
+  "B",        # flake8-bugbear
+  "A",        # flake8-builtins
+  "Q",        # flake8-quotes
+  "RSE",      # flake8-raise
+  "RET",      # flake8-return
+  "SLF",      # flake8-self
+  "C4",       # flake8-comprehensions
+  "G",        # flake8-logging-format
+  "LOG",      # flake8-logging
+  "FA",       # flake8-future-annotations
+  "CPY",      # flake8-copyright
+  "EXE",      # flake8-executable
+  "INP",      # flake8-no-pep420
+  "PIE",      # flake8-pie
+  "PYI",      # flake8-pyi
+  "SIM",      # flake8-simplify
+  "PTH",      # flake8-use-pathlib
+  "FURB",     # refurb
+  "ERA",      # eradicate
+  "NPY",      # NumPy-specific rules
+  "PD",       # pandas-vet
+  "RUF027",   # Possible f-string without an f prefix
+  "RUF100",   # Unused noqa directive
+  "RUF200",   # Failed to parse pyproject.toml
+]
+ignore = [
+  "ERA001",   # Found commented-out code
+  "PERF203",  # try-except within a loop incurs performance overhead
+  "PLW0717",  # Too many statements in try clause
+  "PLC0415",  # import should be at the top-level of a file
+  "PLR0904",  # Too many public methods
+  "PLR0911",  # Too many return statements
+  "PLR0912",  # Too many branches
+  "PLR0913",  # Too many arguments in function definition
+  "PLR0914",  # Too many local variables
+  "PLR0915",  # Too many statements
+  "PLR0916",  # Too many Boolean expressions
+  "PLR0917",  # Too many positional arguments
+]
+
+[tool.ruff.lint.per-file-ignores]
+"*.pyi" = [
+  "N",        # pep8-naming
+]
+"src/crystalllm/entry/*" = [
+  "INP001",   # Implicit namespace package
+]
+"tests/*" = [
+  "INP001",   # Implicit namespace package
+  "F841",     # Unused variable
+  "SLF001",   # Private member access
+  "PLC2701",  # Import private name
+  "PLR6301",  # No self use
+]
+"tests/memory_manager/*" = [
+  "D101",     # Undocumented public class
+  "D102",     # Undocumented public method
+  "D103",     # Undocumented public function
+  "S301",     # Suspicious pickle usage
+  "S403",     # Suspicious pickle import
+  "S404",     # Suspicious subprocess import
+  "S603",     # Subprocess without shell equals true
+]
+"temp/*" = [
+  "INP001",   # Implicit namespace package
+]
+"vendor/nccl/ext-profiler/example/python_ext/*" = [
+  "INP001",   # Implicit namespace package
+]
+
+[tool.ruff.lint.flake8-copyright]
+author = "Aliyun Inc."
+notice-rgx = "(?i)Copyright \\(C\\) \\d{4}"
+
+[tool.ruff.lint.flake8-errmsg]
+max-string-length = 32
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+docstring-code-format = true
+docstring-code-line-length = 64
+line-ending = "lf"

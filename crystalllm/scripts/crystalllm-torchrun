@@ -1,0 +1,259 @@
+#!/bin/bash
+#
+# Copyright (c) 2026 Aliyun Inc. All Rights Reserved.
+#
+# CrystalLLM Torchrun Script
+#
+# This script serves as a torchrun-like distributed training launcher for CrystalLLM.
+# It automatically sets up necessary environment variables for distributed training
+# and spawns multiple processes (one per GPU/process) as specified by --nproc-per-node.
+#
+# Usage: crystalllm-torchrun [torchrun_options] <command> [command_args]
+#
+# Examples:
+#   crystalllm-torchrun --nproc-per-node 4 train.py --epochs 10
+#   crystalllm-torchrun --no-python my_binary --arg1 --arg2
+#
+# Standard torchrun options supported:
+#   --master-addr          Master node address (default: from MASTER_ADDR env or 127.0.0.1)
+#   --master-port          Master node port (default: from MASTER_PORT env or 29500)
+#   --nnodes               Total number of nodes (default: from NNODES env or 1)
+#   --node-rank            Rank of this node (default: from NODE_RANK env or 0)
+#   --nproc-per-node       Number of processes per node (default: from NPROC_PER_NODE or GPUS_PER_NODE env or 1)
+#   --no-python            Do not prepend 'python' to the command (use the command as-is)
+#
+# Environment variables (used if command line args not provided):
+#   MASTER_ADDR            Master node address
+#   MASTER_PORT            Master node port
+#   NNODES                 Total number of nodes
+#   NODE_RANK              Rank of this node
+#   NPROC_PER_NODE         Number of processes per node (alias for GPUS_PER_NODE)
+#   GPUS_PER_NODE          Number of GPUs/processes per node
+#
+
+set -eo pipefail
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Default values (can be overridden by environment variables or command line args)
+DEFAULT_MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+DEFAULT_MASTER_PORT="${MASTER_PORT:-29500}"
+DEFAULT_NNODES="${NNODES:-1}"
+DEFAULT_NODE_RANK="${NODE_RANK:-0}"
+DEFAULT_NPROC_PER_NODE="${NPROC_PER_NODE:-${GPUS_PER_NODE:-1}}"
+
+# Parse torchrun-specific arguments
+MASTER_ADDR="$DEFAULT_MASTER_ADDR"
+MASTER_PORT="$DEFAULT_MASTER_PORT"
+NNODES="$DEFAULT_NNODES"
+NODE_RANK="$DEFAULT_NODE_RANK"
+NPROC_PER_NODE="$DEFAULT_NPROC_PER_NODE"
+NO_PYTHON=false
+
+# Array to hold remaining arguments (command and its args)
+REMAINING_ARGS=()
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --master-addr|--master_addr)
+            MASTER_ADDR="$2"
+            shift 2
+            ;;
+        --master-addr=*|--master_addr=*)
+            MASTER_ADDR="${1#*=}"
+            shift
+            ;;
+        --master-port|--master_port)
+            MASTER_PORT="$2"
+            shift 2
+            ;;
+        --master-port=*|--master_port=*)
+            MASTER_PORT="${1#*=}"
+            shift
+            ;;
+        --nnodes)
+            NNODES="$2"
+            shift 2
+            ;;
+        --nnodes=*)
+            NNODES="${1#*=}"
+            shift
+            ;;
+        --node-rank|--node_rank)
+            NODE_RANK="$2"
+            shift 2
+            ;;
+        --node-rank=*|--node_rank=*)
+            NODE_RANK="${1#*=}"
+            shift
+            ;;
+        --nproc-per-node|--nproc_per_node)
+            NPROC_PER_NODE="$2"
+            shift 2
+            ;;
+        --nproc-per-node=*|--nproc_per_node=*)
+            NPROC_PER_NODE="${1#*=}"
+            shift
+            ;;
+        --no-python|--no_python)
+            NO_PYTHON=true
+            shift
+            ;;
+        --help|-h)
+            echo "Usage: crystalllm-torchrun [options] <command> [command_args]"
+            echo ""
+            echo "CrystalLLM Torchrun - Distributed Training Launcher"
+            echo ""
+            echo "Options:"
+            echo "  --master-addr <addr>      Master node address (default: 127.0.0.1 or \$MASTER_ADDR)"
+            echo "  --master-port <port>      Master node port (default: 29500 or \$MASTER_PORT)"
+            echo "  --nnodes <n>              Total number of nodes (default: 1 or \$NNODES)"
+            echo "  --node-rank <rank>        Rank of this node (default: 0 or \$NODE_RANK)"
+            echo "  --nproc-per-node <n>      Number of processes per node (default: 1 or \$NPROC_PER_NODE/\$GPUS_PER_NODE)"
+            echo "  --no-python               Do not prepend 'python' to the command (use the command as-is)"
+            echo "  --help, -h                Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  crystalllm-torchrun --nproc-per-node 4 train.py --epochs 10"
+            echo "  crystalllm-torchrun --no-python my_binary --arg1 --arg2"
+            echo ""
+            echo "Environment variables (set for each process):"
+            echo "  MASTER_ADDR               Master node address"
+            echo "  MASTER_PORT               Master node port"
+            echo "  NNODES                    Total number of nodes"
+            echo "  NODE_RANK                 Rank of this node"
+            echo "  NPROC_PER_NODE            Number of processes per node"
+            echo "  GPUS_PER_NODE             Alias for NPROC_PER_NODE"
+            echo "  WORLD_SIZE                Total number of processes across all nodes (NNODES * NPROC_PER_NODE)"
+            echo "  LOCAL_WORLD_SIZE          Number of processes on this node (same as NPROC_PER_NODE)"
+            echo "  RANK                      Global rank of the process (0 to WORLD_SIZE-1)"
+            echo "  LOCAL_RANK                Local rank of the process on this node (0 to NPROC_PER_NODE-1)"
+            exit 0
+            ;;
+        -*)
+            # Pass through unknown arguments to the training script
+            REMAINING_ARGS+=("$1")
+            shift
+            ;;
+        *)
+            # First non-option argument is the command
+            REMAINING_ARGS+=("$@")
+            break
+            ;;
+    esac
+done
+
+# Validate required arguments
+if [[ ${#REMAINING_ARGS[@]} -eq 0 ]]; then
+    echo "Error: No command specified."
+    echo "Usage: crystalllm-torchrun [options] <command> [command_args]"
+    exit 1
+fi
+
+# Extract command and its arguments
+if [[ "$NO_PYTHON" == true ]]; then
+    # Use the command as-is
+    COMMAND="${REMAINING_ARGS[0]}"
+    COMMAND_ARGS=("${REMAINING_ARGS[@]:1}")
+else
+    # Prepend 'python' to the command
+    COMMAND="python"
+    COMMAND_ARGS=("${REMAINING_ARGS[@]}")
+fi
+
+# Calculate derived values
+WORLD_SIZE=$((NNODES * NPROC_PER_NODE))
+LOCAL_WORLD_SIZE="$NPROC_PER_NODE"
+
+# Print launch information
+echo "CrystalLLM Torchrun Launch Configuration:"
+echo "  Master Address:    $MASTER_ADDR"
+echo "  Master Port:       $MASTER_PORT"
+echo "  Number of Nodes:   $NNODES"
+echo "  Node Rank:         $NODE_RANK"
+echo "  Processes/Node:    $NPROC_PER_NODE"
+echo "  World Size:        $WORLD_SIZE"
+echo "  Command:           $COMMAND"
+if [[ ${#COMMAND_ARGS[@]} -gt 0 ]]; then
+    echo "  Command Args:      ${COMMAND_ARGS[*]}"
+fi
+echo ""
+
+# Export common environment variables (shared across all processes)
+export MASTER_ADDR
+export MASTER_PORT
+export NNODES
+export NODE_RANK
+export NPROC_PER_NODE
+export WORLD_SIZE
+export LOCAL_WORLD_SIZE
+
+# Arrays to store process PIDs and exit codes
+declare -a PROCESS_PIDS
+declare -a PROCESS_LOCAL_RANKS
+
+# Function to launch a single process with specific local rank
+launch_process() {
+    local local_rank=$1
+
+    # Calculate global rank: rank = node_rank * nproc_per_node + local_rank
+    local rank=$((NODE_RANK * NPROC_PER_NODE + local_rank))
+
+    # Set process-specific environment variables
+    local proc_env="LOCAL_RANK=$local_rank RANK=$rank"
+
+    echo "Launching process $rank (local rank $local_rank on node $NODE_RANK)"
+
+    # Launch the process in background with process-specific env vars
+    # Use exec to replace the shell process, ensuring proper signal handling
+    env $proc_env "$COMMAND" "${COMMAND_ARGS[@]}" &
+
+    # Store PID and local rank
+    PROCESS_PIDS+=($!)
+    PROCESS_LOCAL_RANKS+=($local_rank)
+}
+
+# Launch all processes
+for ((i=0; i<NPROC_PER_NODE; i++)); do
+    launch_process $i
+done
+
+echo ""
+echo "Launched $NPROC_PER_NODE processes"
+
+# Wait for all processes and collect exit codes
+EXIT_CODE=0
+FAILED_PROCESSES=()
+
+for ((i=0; i<${#PROCESS_PIDS[@]}; i++)); do
+    pid=${PROCESS_PIDS[$i]}
+    local_rank=${PROCESS_LOCAL_RANKS[$i]}
+
+    if wait $pid; then
+        echo "Process with local rank $local_rank (PID $pid) completed successfully"
+    else
+        proc_exit_code=$?
+        echo "Process with local rank $local_rank (PID $pid) failed with exit code $proc_exit_code"
+        FAILED_PROCESSES+=("local_rank=$local_rank, exit_code=$proc_exit_code")
+        if [[ $EXIT_CODE -eq 0 ]]; then
+            EXIT_CODE=$proc_exit_code
+        fi
+    fi
+done
+
+# Report results
+echo ""
+if [[ ${#FAILED_PROCESSES[@]} -eq 0 ]]; then
+    echo "All processes completed successfully"
+else
+    echo "Some processes failed:"
+    for failure in "${FAILED_PROCESSES[@]}"; do
+        echo "  - $failure"
+    done
+fi
+
+echo "Exit code: $EXIT_CODE"
+
+exit $EXIT_CODE

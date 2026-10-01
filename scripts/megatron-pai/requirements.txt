@@ -1,0 +1,4 @@
+redis
+numpy<2
+transformers
+datasets

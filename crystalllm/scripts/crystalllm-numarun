@@ -1,0 +1,103 @@
+#!/bin/bash
+#
+# Copyright (c) 2026 Aliyun Inc. All Rights Reserved.
+#
+# CrystalLLM NUMA-aware CPU affinity wrapper for distributed GPU training
+#
+# Bind each torchrun worker process to a dedicated set of CPU cores,
+# partitioned by socket for NUMA-local access.
+#
+# Usage:  crystalllm-torchrun --no-python crystalllm-numarun <command> [args...]
+#
+# Required env vars (set by torchrun):
+#   LOCAL_WORLD_SIZE  - number of GPU workers on this node
+#   LOCAL_RANK        - index of the current worker (0-based)
+#
+# Example (2 Sockets, 64 cores/socket, 8 GPUs):
+#
+#   Socket 0 (cores  0-63)          Socket 1 (cores 64-127)
+#   +-------------+      +---------------+
+#   | GPU0:  0-15 |      | GPU4:  64-79  |
+#   | GPU1: 16-31 |      | GPU5:  80-95  |
+#   | GPU2: 32-47 |      | GPU6:  96-111 |
+#   | GPU3: 48-63 |      | GPU7: 112-127 |
+#   +-------------+      +---------------+
+#
+#   GPUs are partitioned across sockets (no cross-socket interleaving):
+#     GPU0 -> cores  0-15 (Socket 0 only)  = 16 cores
+#     GPU1 -> cores 16-31 (Socket 0 only)  = 16 cores
+#     ...
+#     GPU4 -> cores 64-79 (Socket 1 only)  = 16 cores
+#     ...
+#
+
+set -eo pipefail
+
+# ---------------------------------------------------------------------------
+# 1. Validate torchrun environment
+# ---------------------------------------------------------------------------
+# torchrun should set LOCAL_WORLD_SIZE and LOCAL_RANK
+if [[ -z "$LOCAL_WORLD_SIZE" || -z "$LOCAL_RANK" ]]; then
+    echo >&2 "[WARNING] LOCAL_WORLD_SIZE and LOCAL_RANK must be set"
+    $@
+    exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Check if there are enough CPU cores for binding
+# ---------------------------------------------------------------------------
+NUMBER_OF_CORES=$(nproc --all)
+
+if [[ $NUMBER_OF_CORES -lt $LOCAL_WORLD_SIZE ]]; then
+    echo >&2 "[WARNING] Too few CPU cores ($NUMBER_OF_CORES) to bind"
+    $@
+    exit $?
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Query CPU topology via lscpu
+# ---------------------------------------------------------------------------
+NUMBER_OF_SOCKETS=$(lscpu | awk -F: '($1 == "Socket(s)"){gsub(/ /, "", $2); print $2; found=1} END{exit found!=1}')
+NUMBER_OF_CORES_PER_SOCKET=$(lscpu | awk -F: '($1 == "Core(s) per socket"){gsub(/ /, "", $2); print $2; found=1} END{exit found!=1}')
+
+# ---------------------------------------------------------------------------
+# 4. Compute core range for this LOCAL_RANK
+# ---------------------------------------------------------------------------
+# GPUs per socket (e.g. 8 GPUs / 2 Sockets = 4 GPUs per socket)
+NUMBER_OF_DEVICES_PER_SOCKET=$(( LOCAL_WORLD_SIZE / NUMBER_OF_SOCKETS ))
+
+# Cores per socket allocated to each GPU (e.g. 64 cores / 8 GPUs = 8)
+NUMBER_OF_CORES_PER_SOCKET_PER_DEVICE=$(( NUMBER_OF_CORES_PER_SOCKET / LOCAL_WORLD_SIZE ))
+
+# Which socket this GPU belongs to (for reference, not used in binding range)
+LOCAL_SOCKET=$(( LOCAL_RANK / NUMBER_OF_DEVICES_PER_SOCKET ))
+
+# Compute the contiguous core range for this LOCAL_RANK.
+#
+#   stride = per_socket_cores_per_gpu * num_sockets = total cores per GPU
+#
+#   Example (stride=16):
+#
+#     core id: | 0  1  2 ... 15 | | 16 17 ... 31 | | 32 33 ... 47 | ...
+#              └───── GPU 0 ────┘ └──── GPU 1 ───┘ └──── GPU 2 ───┘
+#              ←──── stride ────→ ←─── stride ───→ ←─── stride ───→
+#
+#     GPU0: BEGIN = 0*16 =  0, END =  0 + 16 - 1 =  15
+#     GPU2: BEGIN = 2*16 = 32, END = 32 + 16 - 1 =  47
+#     GPU4: BEGIN = 4*16 = 64, END = 64 + 16 - 1 =  79
+#
+#   This naturally partitions GPUs across sockets (no interleaving)
+LOCAL_CORES_BEGIN=$(( LOCAL_RANK * NUMBER_OF_CORES_PER_SOCKET_PER_DEVICE * NUMBER_OF_SOCKETS ))
+LOCAL_CORES_END=$(( LOCAL_CORES_BEGIN + NUMBER_OF_CORES_PER_SOCKET_PER_DEVICE * NUMBER_OF_SOCKETS - 1 ))
+
+# ---------------------------------------------------------------------------
+# 5. Set parallelism for math libraries (match bound core count)
+# ---------------------------------------------------------------------------
+export OMP_NUM_THREADS=$(( LOCAL_CORES_END - LOCAL_CORES_BEGIN + 1 ))
+export MKL_NUM_THREADS=$OMP_NUM_THREADS
+export OPENBLAS_NUM_THREADS=$OMP_NUM_THREADS
+
+# ---------------------------------------------------------------------------
+# 6. Launch command with CPU affinity
+# ---------------------------------------------------------------------------
+numactl --physcpubind=${LOCAL_CORES_BEGIN}-${LOCAL_CORES_END} $@

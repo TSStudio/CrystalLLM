@@ -1,0 +1,12 @@
+{
+    "tensor_model_parallel_size": 1,
+    "pipeline_model_parallel_size": 4,
+    "expert_tensor_parallel_size": 1,
+    "expert_model_parallel_size": 8,
+    "global_batch_size": 1024,
+    "micro_batch_size": 1,
+    "sequence_parallel": true,
+    "account_for_embedding_in_pipeline_split": true,
+    "account_for_loss_in_pipeline_split": true,
+    "moe_router_force_load_balancing": true
+}
