@@ -15,7 +15,7 @@ fi
 export PYTHONPATH="${MEGATRON_ROOT}/experimental/lite:${MEGATRON_ROOT}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 
-CASE_CONFIG="${SCRIPT_DIR}/configs/512/A20B_tp_1_pp_4_vpp_1_cp_1_etp_1_ep_8_mbs_1_gbs_1024.json"
+CASE_CONFIG="${2:-${SCRIPT_DIR}/configs/512/A20B_tp_1_pp_4_vpp_1_cp_1_etp_1_ep_8_mbs_1_gbs_1024.json}"
 exec python - "$BENCH" "$CASE_CONFIG" <<'PY'
 import json
 import os

@@ -24,6 +24,13 @@ def parse_args(argv=None):
     parser.add_argument("--server-port", type=int, default=8891)
     parser.add_argument("--master-port", type=int, default=40001)
     parser.add_argument("--available-nodes", type=int, default=2)
+    parser.add_argument("--target-nodes", type=int, default=64)
+    parser.add_argument("--gpus-per-node", type=int, default=8)
+    parser.add_argument("--pp-rank-stride", type=int, default=128)
+    parser.add_argument("--dp-rank-stride", type=int, default=8)
+    parser.add_argument("--case-name", default=CASE)
+    parser.add_argument("--case-config", type=Path)
+    parser.add_argument("--envs-json", type=Path, default=SCRIPT_DIR / "envs.json")
     parser.add_argument(
         "--train-iters",
         type=int,
@@ -39,8 +46,12 @@ def parse_args(argv=None):
     if args.workspace is None:
         parser.error("set CRYSTAL_WORKSPACE or pass --workspace")
     args.workspace = args.workspace.expanduser().resolve()
-    if not 2 <= args.available_nodes <= 64:
-        parser.error("this example requires 2 to 64 available eight-GPU nodes")
+    if args.target_nodes < 2 or not 2 <= args.available_nodes <= args.target_nodes:
+        parser.error("available nodes must be between 2 and target nodes")
+    if args.gpus_per_node < 1 or args.pp_rank_stride < 1 or args.dp_rank_stride < 1:
+        parser.error("GPU count and rank strides must be positive")
+    if args.case_name != Path(args.case_name).name or args.case_name in {".", ".."}:
+        parser.error("case name must be a single directory name")
     if args.train_iters < 3:
         parser.error("--train-iters must be at least 3 for replay warmup")
     for port in (args.server_port, args.master_port):
@@ -50,7 +61,10 @@ def parse_args(argv=None):
 
 
 def make_command(args):
-    base = args.workspace / "logs" / CASE
+    base = args.workspace / "logs" / args.case_name
+    train_args = shlex.quote(str(args.workspace / "Megatron-LM"))
+    if args.case_config is not None:
+        train_args += " " + shlex.quote(str(args.case_config.expanduser().resolve()))
     command = [
         "crystalllm",
         "run",
@@ -58,13 +72,13 @@ def make_command(args):
         "--crystal-workspace",
         str(args.workspace),
         "--log-dir-name",
-        f"logs/{CASE}/{args.mode}",
+        f"logs/{args.case_name}/{args.mode}",
         "--target-nodes",
-        "64",
+        str(args.target_nodes),
         "--available-nodes",
         str(args.available_nodes),
         "--gpus-per-node",
-        "8",
+        str(args.gpus_per_node),
         "--train-script-path",
         str(SCRIPT_DIR / "train.sh"),
         "--server-addr",
@@ -79,9 +93,9 @@ def make_command(args):
         str(ANALYSIS_ITERS),
         # Crystal joins these values into a shell command before node launch.
         "--pretrain-args",
-        shlex.quote(str(args.workspace / "Megatron-LM")),
+        train_args,
         "--pretrain-envs-json",
-        str(SCRIPT_DIR / "envs.json"),
+        str(args.envs_json.expanduser().resolve()),
     ]
     if args.mode != "capture":
         command += [
@@ -92,9 +106,9 @@ def make_command(args):
             "--graph-dir",
             str(base / "capture/graph"),
             "--pp-rank-stride",
-            "128",
+            str(args.pp_rank_stride),
             "--dp-rank-stride",
-            "8",
+            str(args.dp_rank_stride),
             "--tensor-provider",
             str(
                 ARTIFACT
