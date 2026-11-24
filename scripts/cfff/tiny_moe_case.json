@@ -1,0 +1,22 @@
+{
+  "backend": "mlite",
+  "hf_path": "tiny_qwen3_moe",
+  "model_name": "qwen3_moe",
+  "tp": 1,
+  "pp": 1,
+  "vpp": 1,
+  "cp": 1,
+  "etp": 1,
+  "ep": 2,
+  "warmup": 0,
+  "num_microbatches": 2,
+  "seq_len": 128,
+  "skip_load_hf_weights": true,
+  "disable_mtp": true,
+  "impl_cfg_json": {
+    "use_thd": false,
+    "use_deepep": false,
+    "cross_entropy_fusion": true,
+    "recompute": ["core_attn"]
+  }
+}

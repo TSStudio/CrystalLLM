@@ -50,6 +50,14 @@ def parse_args(argv=None):
         parser.error("available nodes must be between 2 and target nodes")
     if args.gpus_per_node < 1 or args.pp_rank_stride < 1 or args.dp_rank_stride < 1:
         parser.error("GPU count and rank strides must be positive")
+    if (args.target_nodes, args.gpus_per_node) != (64, 8) and args.case_config is None:
+        parser.error("a custom layout requires --case-config for a compatible workload")
+    if args.mode != "capture":
+        world_size = args.target_nodes * args.gpus_per_node
+        if (args.dp_rank_stride % args.gpus_per_node or
+                args.pp_rank_stride % args.dp_rank_stride or
+                world_size % args.pp_rank_stride):
+            parser.error("rank strides must align with whole nodes and divide the world size")
     if args.case_name != Path(args.case_name).name or args.case_name in {".", ".."}:
         parser.error("case name must be a single directory name")
     if args.train_iters < 3:
