@@ -1,0 +1,352 @@
+--- a/torch/distributed/distributed_c10d.py
++++ b/torch/distributed/distributed_c10d.py
+@@ -49,6 +49,10 @@
+ from .c10d_logger import _exception_logger, _time_logger
+ from .constants import default_pg_nccl_timeout, default_pg_timeout
+ from .rendezvous import register_rendezvous_handler, rendezvous  # noqa: F401
++
++from crystalllm.patch import crystal_patch_response
++from crystalllm.torch import (CrystalFakeProcessGroup, cond_crystal_c10d_trace_writer, cond_crystal_collectives_handler, cond_custom_write_crystal_c10d_trace, cond_crystal_c10d_start_coalescing, cond_crystal_c10d_end_coalescing)
++_FAKE_DEFAULT_PG = None
+ 
+ 
+ __all__ = [
+@@ -1120,6 +1124,8 @@
+ 
+ def is_initialized() -> bool:
+     """Check if the default process group has been initialized."""
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        return _FAKE_DEFAULT_PG is not None
+     return GroupMember.WORLD is not None
+ 
+ 
+@@ -1146,6 +1152,8 @@
+ 
+ def _get_default_group() -> ProcessGroup:
+     """Get the default process group created by init_process_group."""
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        return _FAKE_DEFAULT_PG
+     if not is_initialized():
+         raise ValueError(
+             "Default process group has not been initialized, "
+@@ -1208,6 +1216,8 @@
+         The backend of the given process group as a lower case string.
+ 
+     """
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        return "fake"
+     pg = group or _get_default_group()
+     if _rank_not_in_group(pg):
+         raise ValueError("Invalid process group specified")
+@@ -1449,6 +1459,23 @@
+ 
+     global _backend
+     global _default_pg_init_method
++    global _FAKE_DEFAULT_PG
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        logger.info("Crystal communication capturing enabled, bypass init_process_group and new_group")
++        if _FAKE_DEFAULT_PG is not None:
++            raise ValueError("trying to initialize the default process group twice!")
++        group_name = _process_group_name([], use_hashed_name=False)
++        _FAKE_DEFAULT_PG = CrystalFakeProcessGroup(
++            list(range(world_size)),
++            rank,
++            group_name,
++            "default_pg"
++        )
++        _world.pg_group_ranks[_FAKE_DEFAULT_PG] = {
++            global_rank: group_rank for group_rank, global_rank in enumerate(range(world_size))
++        }
++        _world.pg_names[_FAKE_DEFAULT_PG] = group_name
++        return _FAKE_DEFAULT_PG
+ 
+     if GroupMember.WORLD is not None:
+         raise ValueError("trying to initialize the default process group twice!")
+@@ -1895,6 +1922,9 @@
+                                         be destroyed.
+     """
+     global _world
++    global _FAKE_DEFAULT_PG
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        return
+ 
+     if group == GroupMember.NON_GROUP_MEMBER:
+         return
+@@ -1991,6 +2021,13 @@
+         -1, if not part of the group
+ 
+     """
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        if _rank_not_in_group(group):
++            return -1
++        if group is None:
++            return _FAKE_DEFAULT_PG.rank()
++        else:
++            return group.rank()
+     if _rank_not_in_group(group):
+         return -1
+ 
+@@ -2014,12 +2051,22 @@
+         -1, if not part of the group
+ 
+     """
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        if _rank_not_in_group(group):
++            return -1
++        if group is None:
++            return _FAKE_DEFAULT_PG.size()
++        else:
++            return group.size()
+     if _rank_not_in_group(group):
+         return -1
+ 
+     return _get_group_size(group)
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ def isend(
+     tensor: torch.Tensor, dst: int, group: Optional[ProcessGroup] = None, tag: int = 0
+ ) -> Optional[Work]:
+@@ -2062,6 +2109,9 @@
+     return pg.send([tensor], dst, tag)
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ def irecv(
+     tensor: torch.Tensor,
+     src: Optional[int] = None,
+@@ -2110,6 +2160,9 @@
+             return pg.recv([tensor], group_src_rank, tag)
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def send(
+     tensor: torch.Tensor, dst: int, group: Optional[ProcessGroup] = None, tag: int = 0
+@@ -2151,6 +2204,9 @@
+         group.send([tensor], group_dst_rank, tag).wait()
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def recv(
+     tensor: torch.Tensor,
+@@ -2381,6 +2437,9 @@
+         return reqs
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def broadcast(tensor, src, group=None, async_op=False):
+     """
+@@ -2425,6 +2484,9 @@
+         work.wait()
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def all_reduce(tensor, op=ReduceOp.SUM, group=None, async_op=False):
+     """
+@@ -2571,6 +2633,9 @@
+         work.wait()
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def reduce(tensor, dst, op=ReduceOp.SUM, group=None, async_op=False):
+     """
+@@ -3271,6 +3336,9 @@
+     )
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def all_gather(tensor_list, tensor, group=None, async_op=False):
+     """
+@@ -3346,6 +3414,9 @@
+         work.wait()
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False):
+     """
+@@ -3440,6 +3511,9 @@
+         work.wait()
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ @deprecated(
+     "`torch.distributed._all_gather_base` is a private function and will be deprecated. "
+@@ -3568,6 +3642,9 @@
+         )
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def gather(tensor, gather_list=None, dst=0, group=None, async_op=False):
+     """
+@@ -3625,6 +3702,9 @@
+         work.wait()
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def scatter(tensor, scatter_list=None, src=0, group=None, async_op=False):
+     """
+@@ -3723,6 +3803,9 @@
+         work.wait()
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def reduce_scatter(output, input_list, op=ReduceOp.SUM, group=None, async_op=False):
+     """
+@@ -3762,6 +3845,9 @@
+         work.wait()
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def reduce_scatter_tensor(output, input, op=ReduceOp.SUM, group=None, async_op=False):
+     """
+@@ -3848,6 +3934,9 @@
+         work.wait()
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @deprecated(
+     "`torch.distributed._reduce_scatter_base` is a private function and will be deprecated. "
+     "Please use `torch.distributed.reduce_scatter_tensor` instead.",
+@@ -3876,6 +3965,9 @@
+     return reduce_scatter_tensor(output, input, op, group, async_op)
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def all_to_all_single(
+     output,
+@@ -4003,6 +4095,9 @@
+         work.wait()
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def all_to_all(output_tensor_list, input_tensor_list, group=None, async_op=False):
+     """
+@@ -4119,6 +4214,9 @@
+         work.wait()
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ @_exception_logger
+ def barrier(group=GroupMember.WORLD, async_op=False, device_ids=None):
+     """
+@@ -4164,6 +4262,9 @@
+         work.wait()
+ 
+ 
++@crystal_patch_response
++@cond_crystal_c10d_trace_writer
++@cond_crystal_collectives_handler
+ def monitored_barrier(group=GroupMember.WORLD, timeout=None, wait_all_ranks=False):
+     """
+     Synchronize processes similar to ``torch.distributed.barrier``, but consider a configurable timeout.
+@@ -4562,6 +4663,60 @@
+     multiple overlaping process groups. To avoid that, make sure all ranks follow the
+     same global creation order.
+     """
++    if os.getenv("CRYSTAL_C10D_CAPTURING") is not None:
++        # Copied from _new_group_with_tag()
++        global_rank = get_rank()
++        global_world_size = get_world_size()
++        if ranks is not None:
++            ranks = sorted(ranks)
++            group_world_size = len(ranks)
++            if group_world_size > global_world_size:
++                raise ValueError(
++                    "the new group's world size should be less or "
++                    "equal to the world size set by "
++                    "init_process_group"
++                )
++            # check ranks' sanity
++            for rank in ranks:
++                if rank < 0 or rank >= global_world_size:
++                    raise ValueError(
++                        "The new group's rank should be within "
++                        "the world_size set by init_process_group"
++                    )
++            if global_rank in ranks:
++                group_rank = ranks.index(global_rank)
++            else:
++                group_rank = None
++        else:
++            ranks = list(range(global_world_size))
++            group_world_size = global_world_size
++            group_rank = global_rank
++        group_name = _process_group_name(ranks, use_hashed_name=use_local_synchronization)
++        # If the rank is in the ranks list, return a fake process group. Otherwise,
++        # return GroupMember.NON_GROUP_MEMBER as _new_process_group_helper() did
++        if global_rank in ranks:
++            pg = CrystalFakeProcessGroup(
++                ranks,
++                group_rank,
++                group_name,
++                group_desc
++            )
++        else:
++            pg = GroupMember.NON_GROUP_MEMBER
++        cond_custom_write_crystal_c10d_trace("NEW_GROUP", str({
++            "ranks": ranks,
++            "timeout": timeout,
++            "backend": backend,
++            "group_name": group_name,
++            "group_desc": group_desc,
++        }))
++        # Copied from _new_group_with_tag()
++        _world.pg_group_ranks[pg] = {
++            global_rank: group_rank for group_rank, global_rank in enumerate(ranks)
++        }
++        if pg != GroupMember.NON_GROUP_MEMBER:
++            _world.pg_names[pg] = group_name
++        return pg
+     return _new_group_with_tag(
+         ranks,
+         timeout,
