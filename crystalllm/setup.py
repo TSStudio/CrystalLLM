@@ -198,9 +198,12 @@ def _build_nccl():
         env.update(config["env"])
 
         # Prepare make command
+        jobs = os.environ.get("CRYSTALLLM_BUILD_JOBS")
+        if jobs is not None and (not jobs.isdigit() or int(jobs) < 1):
+            raise ValueError("CRYSTALLLM_BUILD_JOBS must be a positive integer")
         cmd = [
             make_cmd,
-            "-j",
+            f"-j{jobs}" if jobs is not None else "-j",
             "src.build",
             f'NVCC_GENCODE="{nvcc_gencode}"',
             f"BUILDDIR={builddir.absolute()}",
